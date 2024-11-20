@@ -1,7 +1,8 @@
-from flask_restful import Api, output_json
+from flask_restful import Api
+from zou.app.utils.flask import output_json
 
 
-def configure_api_from_blueprint(blueprint, route_tuples):
+def configure_api_from_blueprint(blueprint, route_tuples, decorators=None):
     """
     Creates a Flask Restful api object based on information from given
     blueprint. API is configured to return JSON objects.
@@ -10,10 +11,9 @@ def configure_api_from_blueprint(blueprint, route_tuples):
     route and the related resource (controller).
     """
 
-    api = Api(blueprint, catch_all_404s=True)
+    api = Api(blueprint, catch_all_404s=True, decorators=decorators)
 
     api.representations = {
-        "application/json; charset=utf-8": output_json,
         "application/json": output_json,
     }
 

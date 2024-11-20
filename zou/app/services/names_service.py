@@ -1,13 +1,18 @@
 import slugify
 
-from zou.app.models.organisation import Organisation
+from zou.app.utils import cache
+
 from zou.app.services import (
     entities_service,
     files_service,
     projects_service,
     tasks_service,
     shots_service,
+    persons_service,
 )
+
+
+cache.memoize_function(1200)
 
 
 def get_full_entity_name(entity_id):
@@ -47,7 +52,7 @@ def get_full_entity_name(entity_id):
         asset_type = entities_service.get_entity_type(entity["entity_type_id"])
         episode_id = entity["source_id"]
         name = "%s / %s" % (asset_type["name"], entity["name"])
-    return (name, episode_id)
+    return (name, episode_id, entity["preview_file_id"])
 
 
 def get_preview_file_name(preview_file_id):
@@ -56,15 +61,15 @@ def get_preview_file_name(preview_file_id):
     convention followed is:
     [project_name]_[entity_name]_[task_type_name]_v[revivision].[extension].
     """
-    organisation = Organisation.query.first()
+    organisation = persons_service.get_organisation()
     preview_file = files_service.get_preview_file(preview_file_id)
     task = tasks_service.get_task(preview_file["task_id"])
     task_type = tasks_service.get_task_type(task["task_type_id"])
     project = projects_service.get_project(task["project_id"])
-    (entity_name, _) = get_full_entity_name(task["entity_id"])
+    (entity_name, _, _) = get_full_entity_name(task["entity_id"])
 
     if (
-        organisation.use_original_file_name
+        organisation["use_original_file_name"]
         and preview_file.get("original_name", None) is not None
     ):
         name = preview_file["original_name"]

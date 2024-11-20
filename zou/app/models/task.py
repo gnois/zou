@@ -30,9 +30,10 @@ class Task(db.Model, BaseMixin, SerializerMixin):
     """
 
     name = db.Column(db.String(80), nullable=False)
-    description = db.Column(db.String(200))
+    description = db.Column(db.Text())
 
     priority = db.Column(db.Integer, default=0)
+    difficulty = db.Column(db.Integer, default=3, nullable=False)
     duration = db.Column(db.Float, default=0)
     estimation = db.Column(db.Float, default=0)
     completion_rate = db.Column(db.Integer, default=0)
@@ -42,10 +43,12 @@ class Task(db.Model, BaseMixin, SerializerMixin):
     due_date = db.Column(db.DateTime)
     real_start_date = db.Column(db.DateTime)
     end_date = db.Column(db.DateTime)
+    done_date = db.Column(db.DateTime)
     last_comment_date = db.Column(db.DateTime)
     nb_assets_ready = db.Column(db.Integer, default=0)
     data = db.Column(JSONB)
     shotgun_id = db.Column(db.Integer)
+    last_preview_file_id = db.Column(UUIDType(binary=False))
 
     project_id = db.Column(
         UUIDType(binary=False), db.ForeignKey("project.id"), index=True
@@ -68,10 +71,13 @@ class Task(db.Model, BaseMixin, SerializerMixin):
         db.UniqueConstraint(
             "name", "project_id", "task_type_id", "entity_id", name="task_uc"
         ),
+        db.CheckConstraint(
+            "difficulty > 0 AND difficulty < 6", name="check_difficulty"
+        ),
     )
 
     def assignees_as_string(self):
-        return ", ".join([x.full_name() for x in self.assignees])
+        return ", ".join([x.full_name for x in self.assignees])
 
     def set_assignees(self, person_ids):
         from zou.app.models.person import Person

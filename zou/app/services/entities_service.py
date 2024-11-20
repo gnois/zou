@@ -3,13 +3,22 @@ from zou.app.services import (
     projects_service,
     notifications_service,
 )
-from zou.app.utils import cache, events, fields
+from zou.app.utils import (
+    date_helpers,
+    cache,
+    events,
+    fields,
+    query as query_utils,
+)
 
-from zou.app.models.entity import Entity, EntityLink
+from zou.app.models.entity import Entity, EntityLink, EntityConceptLink
 from zou.app.models.entity_type import EntityType
 from zou.app.models.preview_file import PreviewFile
+from zou.app.models.project import Project
 from zou.app.models.task import assignees_table
 from zou.app.models.task import Task
+
+from zou.app import db
 
 from zou.app.services.exception import (
     PreviewFileNotFoundException,
@@ -112,7 +121,7 @@ def update_entity_preview(entity_id, preview_file_id):
     )
     entity_type = EntityType.get(entity.entity_type_id)
     entity_type_name = "asset"
-    if entity_type.name in ["Shot", "Scene", "Sequence", "Episode"]:
+    if entity_type.name in ["Shot", "Scene", "Sequence", "Episode", "Concept"]:
         entity_type_name = entity_type.name.lower()
     events.emit(
         "%s:update" % entity_type_name,
@@ -152,15 +161,54 @@ def get_entities_for_project(
     return Entity.serialize_list(result, obj_type=obj_type)
 
 
-def get_entity_links_for_project(project_id):
+def get_entity_links_for_project(
+    project_id,
+    page=None,
+    limit=None,
+    cursor_created_at=None,
+):
     """
-    Retrieve entity links for
+    Retrieve entity links for given project.
     """
-    query = EntityLink.query.join(
+    query = EntityLink.query.filter(Entity.project_id == project_id).join(
         Entity, EntityLink.entity_in_id == Entity.id
-    ).filter(Entity.project_id == project_id)
-    result = query.all()
-    return Entity.serialize_list(result)
+    )
+
+    results = []
+    if page is not None and page > 0:
+        if limit < 1:
+            limit = None
+        query = query.order_by(EntityLink.created_at, EntityLink.id)
+        results = query_utils.get_paginated_results(query, page, limit=limit)
+    elif cursor_created_at is not None:
+        if limit < 1:
+            limit = None
+        created_at = date_helpers.get_datetime_from_string(
+            cursor_created_at, milliseconds=True
+        )
+        results = query_utils.get_cursor_results(
+            EntityLink, query, created_at, limit=limit
+        )
+    else:
+        query = query.order_by(EntityLink.created_at, EntityLink.id)
+        if limit is not None and limit > 0:
+            query = query.limit(limit)
+        for entity_link in query.all():
+            results.append(
+                {
+                    "id": entity_link.id,
+                    "entity_in_id": entity_link.entity_in_id,
+                    "entity_out_id": entity_link.entity_out_id,
+                    "nb_occurences": entity_link.nb_occurences,
+                    "label": entity_link.label,
+                    "data": entity_link.data,
+                    "created_at": date_helpers.get_date_string(
+                        entity_link.created_at, milliseconds=True
+                    ),
+                    "type": "EntityLink",
+                }
+            )
+    return results
 
 
 def get_entities_and_tasks(criterions={}):
@@ -192,7 +240,9 @@ def get_entities_and_tasks(criterions={}):
             Task.end_date,
             Task.start_date,
             Task.due_date,
+            Task.done_date,
             Task.last_comment_date,
+            Task.difficulty,
             assignees_table.columns.person,
         )
     )
@@ -221,7 +271,9 @@ def get_entities_and_tasks(criterions={}):
         task_end_date,
         task_start_date,
         task_due_date,
+        task_done_date,
         task_last_comment_date,
+        task_difficulty,
         person_id,
     ) in query.all():
         entity_id = str(entity.id)
@@ -257,6 +309,7 @@ def get_entities_and_tasks(criterions={}):
                         "entity_id": entity_id,
                         "end_date": task_end_date,
                         "due_date": task_due_date,
+                        "done_date": task_done_date,
                         "duration": task_duration,
                         "is_subscribed": subscription_map.get(task_id, False),
                         "last_comment_date": task_last_comment_date,
@@ -264,6 +317,7 @@ def get_entities_and_tasks(criterions={}):
                         "real_start_date": task_real_start_date,
                         "retake_count": task_retake_count,
                         "start_date": task_start_date,
+                        "difficulty": task_difficulty,
                         "task_status_id": str(task_status_id),
                         "task_type_id": str(task_type_id),
                         "assignees": [],
@@ -313,3 +367,144 @@ def remove_not_allowed_fields_from_metadata(
         for key in data.keys()
         if key not in not_allowed_descriptors_field_names
     }
+
+
+def get_linked_entities_with_tasks(entity_id):
+    """
+    Return all entities and their tasks linked to given entity.
+    """
+    entities_in = (
+        db.session.query(EntityConceptLink.entity_in_id)
+        .filter(EntityConceptLink.entity_out_id == entity_id)
+        .distinct()
+    )
+
+    entity_map = {}
+    task_map = {}
+
+    query = (
+        Entity.query.join(Project, Project.id == Entity.project_id)
+        .outerjoin(Task, Task.entity_id == Entity.id)
+        .outerjoin(assignees_table)
+        .join(EntityType)
+        .add_columns(
+            Task.id,
+            Task.task_type_id,
+            Task.task_status_id,
+            Task.priority,
+            Task.estimation,
+            Task.duration,
+            Task.retake_count,
+            Task.real_start_date,
+            Task.end_date,
+            Task.start_date,
+            Task.due_date,
+            Task.last_comment_date,
+            Task.nb_assets_ready,
+            Task.assigner_id,
+            assignees_table.columns.person,
+            Project.id,
+            Project.name,
+            EntityType.name,
+        )
+        .filter(Entity.id.in_(entities_in))
+    )
+    query_result = query.all()
+
+    for (
+        entity,
+        task_id,
+        task_type_id,
+        task_status_id,
+        task_priority,
+        task_estimation,
+        task_duration,
+        task_retake_count,
+        task_real_start_date,
+        task_end_date,
+        task_start_date,
+        task_due_date,
+        task_last_comment_date,
+        task_nb_assets_ready,
+        task_assigner_id,
+        person_id,
+        project_id,
+        project_name,
+        entity_type_name,
+    ) in query_result:
+        entity_id = str(entity.id)
+
+        if entity_id not in entity_map:
+            data = fields.serialize_value(entity.data or {})
+
+            entity_map[entity_id] = fields.serialize_dict(
+                {
+                    "canceled": entity.canceled,
+                    "data": data,
+                    "description": entity.description,
+                    "entity_type_id": entity.entity_type_id,
+                    "fps": data.get("fps", None),
+                    "frame_in": data.get("frame_in", None),
+                    "frame_out": data.get("frame_out", None),
+                    "id": entity.id,
+                    "name": entity.name,
+                    "nb_frames": entity.nb_frames,
+                    "parent_id": entity.parent_id,
+                    "preview_file_id": entity.preview_file_id or None,
+                    "project_id": project_id,
+                    "project_name": project_name,
+                    "source_id": entity.source_id,
+                    "nb_entities_out": entity.nb_entities_out,
+                    "is_casting_standby": entity.is_casting_standby,
+                    "tasks": [],
+                    "entity_concept_links": entity.entity_concept_links,
+                    "type": (
+                        entity_type_name
+                        if entity_type_name
+                        in [
+                            "Shot",
+                            "Sequence",
+                            "Scene",
+                            "Edit",
+                            "Concept",
+                            "Episode",
+                        ]
+                        else "Asset"
+                    ),
+                    "updated_at": entity.updated_at,
+                    "created_at": entity.created_at,
+                    "created_by": entity.created_by,
+                }
+            )
+
+        if task_id is not None:
+            task_id = str(task_id)
+            if task_id not in task_map:
+                task_dict = fields.serialize_dict(
+                    {
+                        "id": task_id,
+                        "duration": task_duration,
+                        "due_date": task_due_date,
+                        "end_date": task_end_date,
+                        "entity_id": entity_id,
+                        "estimation": task_estimation,
+                        "last_comment_date": task_last_comment_date,
+                        "nb_assets_ready": task_nb_assets_ready,
+                        "priority": task_priority or 0,
+                        "real_start_date": task_real_start_date,
+                        "retake_count": task_retake_count,
+                        "start_date": task_start_date,
+                        "task_status_id": task_status_id,
+                        "task_type_id": task_type_id,
+                        "assigner_id": task_assigner_id,
+                        "assignees": [],
+                    }
+                )
+                task_map[task_id] = task_dict
+                entity_dict = entity_map[entity_id]
+                entity_dict["tasks"].append(task_dict)
+
+            if person_id:
+                task_map[task_id]["assignees"].append(str(person_id))
+
+    return list(entity_map.values())

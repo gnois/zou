@@ -16,6 +16,7 @@ class PermissionTestCase(ApiDBTestCase):
 
     def tearDown(self):
         self.log_out()
+        super(PermissionTestCase, self).tearDown()
 
     def test_admin_can_create_project(self):
         self.log_in(self.user["email"])
@@ -73,16 +74,16 @@ class PermissionTestCase(ApiDBTestCase):
             "last_name": "Doe",
             "email": "john.doe@gmail.com",
         }
-        self.post("data/persons/new", data, 403)
+        self.post("data/persons", data, 403)
 
     def test_admin_can_create_person(self):
         self.log_in_admin()
         data = {
             "first_name": "John",
             "last_name": "Doe",
-            "email": "john.doe@gmail.com",
+            "email": "john.doe1@gmail.com",
         }
-        self.post("data/persons/new", data, 201)
+        self.post("data/persons", data, 201)
 
     def test_manager_cannot_update_admin(self):
         self.log_in_manager()

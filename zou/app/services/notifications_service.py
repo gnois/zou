@@ -1,6 +1,5 @@
 from sqlalchemy.exc import StatementError
 
-from zou.app.models.comment import Comment
 from zou.app.models.project import Project
 from zou.app.models.entity import Entity
 from zou.app.models.notification import Notification
@@ -11,9 +10,9 @@ from zou.app.models.task_type import TaskType
 from zou.app.services import (
     assets_service,
     emails_service,
-    persons_service,
     projects_service,
     tasks_service,
+    persons_service,
 )
 from zou.app.services.exception import PersonNotFoundException
 from zou.app.utils import events, fields, query as query_utils
@@ -65,7 +64,6 @@ def get_notification_recipients(task, replies=[]):
     every people who commented the task.
     """
     recipients = set()
-    comments = Comment.get_all_by(object_id=task["id"])
     task_subscriptions = get_task_subscriptions(task)
     sequence_subscriptions = get_sequence_subscriptions(task)
 
@@ -191,8 +189,9 @@ def create_notifications_for_task_and_reply(task, comment, reply):
     recipient_ids = get_notification_recipients(task, comment["replies"])
     if reply["person_id"] in recipient_ids:
         recipient_ids.remove(reply["person_id"])
-    recipient_ids.add(comment["person_id"])
     author_id = reply["person_id"]
+    if author_id != comment["person_id"]:
+        recipient_ids.add(comment["person_id"])
     task = tasks_service.get_task(comment["object_id"])
     for recipient_id in recipient_ids:
         try:
@@ -470,7 +469,7 @@ def get_notifications_for_project(project_id, page=0):
     return query_utils.get_paginated_results(query, page)
 
 
-def get_subscriptions_for_user(project_id, entity_type_id):
+def get_subscriptions_for_user(project_id, entity_type_id=None):
     subscription_map = {}
     if project_id is not None:
         user_id = persons_service.get_current_user()["id"]

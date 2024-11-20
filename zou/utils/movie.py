@@ -10,6 +10,7 @@ import tempfile
 import ffmpeg
 import opentimelineio as otio
 
+
 logger = logging.getLogger(__name__)
 loghandler = logging.StreamHandler()
 loghandler.setLevel(logging.INFO)
@@ -28,13 +29,9 @@ EncodingParameters = namedtuple(
 def log_ffmpeg_error(e, action):
     logger.info(f"Error (in action {action}):")
     if e.stdout:
-        logger.info("stdout:")
-        logger.info(e.stdout.decode())
-        logger.info("======")
+        logger.info(f"stdout:\n{e.stdout.decode(errors='replace')}\n======")
     if e.stderr:
-        logger.error("stderr:")
-        logger.error(e.stderr.decode())
-        logger.error("======")
+        logger.error(f"stderr:\n{e.stderr.decode(errors='replace')}\n======")
 
 
 def save_file(tmp_folder, instance_id, file_to_save):
@@ -54,18 +51,20 @@ def generate_thumbnail(movie_path):
     Generate a thumbnail to represent the movie given at movie path. It
     takes a picture at the first frame of the movie.
     """
-    folder_path = os.path.dirname(movie_path)
     file_source_name = os.path.basename(movie_path)
     file_target_name = "%s.png" % file_source_name[:-4]
-    file_target_path = os.path.join(folder_path, file_target_name)
+    file_target_path = os.path.join(tempfile.gettempdir(), file_target_name)
 
     try:
         ffmpeg.input(movie_path, ss="00:00:00").output(
             file_target_path, vframes=1
-        ).run(quiet=True)
+        ).overwrite_output().run(quiet=True)
     except ffmpeg._run.Error as e:
-        log_ffmpeg_error(e, "generate_thumbnail")
+        log_ffmpeg_error(e, "an error occured during generate_thumbnail")
         raise (e)
+    except:
+        print("Error while generating thumbnail")
+        raise
     return file_target_path
 
 
@@ -74,10 +73,9 @@ def extract_frame_from_movie(movie_path, frame_number, movie_fps):
     Extract a frame from the movie given at movie path. It
     takes a picture at the specified time of the movie.
     """
-    folder_path = os.path.dirname(movie_path)
     file_source_name = os.path.basename(movie_path)
     file_target_name = f"{file_source_name[:-4]}_{frame_number}.png"
-    file_target_path = os.path.join(folder_path, file_target_name)
+    file_target_path = os.path.join(tempfile.gettempdir(), file_target_name)
 
     frame_time = otio.opentime.RationalTime(
         frame_number - 1, float(movie_fps)
@@ -94,46 +92,49 @@ def extract_frame_from_movie(movie_path, frame_number, movie_fps):
     return file_target_path
 
 
-def get_all_frames(movie_path):
-    """
-    Generate thumbnails to represent the movie given at movie path. It
-    takes a picture at each frame of the movie.
-    """
-    folder_path = os.path.join(os.getcwd(), "movie_frames")
-    os.makedirs(folder_path, exist_ok=True)
-    file_source_name = os.path.basename(movie_path)
-    file_target_name = f"{file_source_name[:-4]}_%d.png"
-    file_target_path = os.path.join(folder_path, file_target_name)
-
-    try:
-        (
-            ffmpeg.input(movie_path)
-            .output(file_target_path, vsync=0)
-            .run(quiet=True)
-        )
-    except subprocess.CalledProcessError as e:
-        print(f"Error generating thumbnails: {e}")
-        raise e
-
-    return folder_path
-
-
 def generate_tile(movie_path):
     """
-    ffmpeg -i {movie_path} -vf 'scale=150:100,tile=8x8' -an -vsync 0 tile%03d.png
+    Generates a tile from a movie.
     """
+    file_source_name = os.path.basename(movie_path)
+    file_target_name = f"{file_source_name[:-4]}_tile.png"
+    file_target_path = os.path.join(tempfile.gettempdir(), file_target_name)
+    video_track = get_video_track(movie_path, "generate_tile")
+    duration = get_movie_duration(video_track=video_track)
+    fps = get_movie_fps(video_track=video_track)
+    duration_in_frames = int(duration * fps)
+    rows = min(math.ceil(duration_in_frames / 8), 480)
+    ratio = get_movie_display_aspect_ratio(video_track=video_track)
+    height = 100
+    width = math.ceil(height * ratio)
+    if rows == 480:
+        select = (
+            rf"select='not(mod(n\,{math.ceil(duration_in_frames/3840)}))',"
+        )
+    else:
+        select = ""
+    try:
+        ffmpeg.input(movie_path).output(
+            file_target_path,
+            vf=f"{select}scale={width}:{height},tile=8x{rows}",
+        ).overwrite_output().run(quiet=True)
+    except ffmpeg._run.Error as e:
+        log_ffmpeg_error(e, "An error occured while generating the tile.")
+        raise e
+
+    return file_target_path
 
 
-def get_movie_size(movie_path):
+def get_video_track(movie_path, action_name="get_video_track"):
     """
-    Returns movie resolution (extract a frame and returns its size).
+    Returns the video track of a movie.
     """
     try:
-        probe = ffmpeg.probe(movie_path)
+        probe = ffmpeg.probe(movie_path, select_streams="v")
     except ffmpeg._run.Error as e:
-        log_ffmpeg_error(e, "get_movie_size")
+        log_ffmpeg_error(e, action_name)
         raise (e)
-    video = next(
+    video_track = next(
         (
             stream
             for stream in probe["streams"]
@@ -141,12 +142,64 @@ def get_movie_size(movie_path):
         ),
         None,
     )
+    return video_track
+
+
+def get_movie_size(movie_path=None, video_track=None):
+    """
+    Returns movie resolution (extract a frame and returns its size).
+    """
+    if video_track is None:
+        video_track = get_video_track(movie_path, "get_movie_size")
     width = 1
     height = 1
-    if video is not None:
-        width = int(video["width"])
-        height = int(video["height"])
+    if video_track is not None:
+        width = int(video_track["width"])
+        height = int(video_track["height"])
     return (width, height)
+
+
+def get_movie_fps(movie_path=None, video_track=None):
+    """
+    Returns movie fps.
+    """
+    if video_track is None:
+        video_track = get_video_track(movie_path, "get_movie_fps")
+    fps = 25
+    if video_track is not None:
+        fps = float(video_track["r_frame_rate"].split("/")[0])
+    return fps
+
+
+def get_movie_display_aspect_ratio(movie_path=None, video_track=None):
+    """
+    Returns movie display aspect ratio, if display aspect ratio
+    is not set, fallback on width / height.
+    """
+    if video_track is None:
+        video_track = get_video_track(
+            movie_path, "get_movie_display_aspect_ratio"
+        )
+    ratio = 1
+    if video_track is not None:
+        try:
+            width, height = video_track["display_aspect_ratio"].split(":")
+        except KeyError:
+            width, height = video_track["width"], video_track["height"]
+        ratio = float(width) / float(height)
+    return ratio
+
+
+def get_movie_duration(movie_path=None, video_track=None):
+    """
+    Returns movie duration in seconds.
+    """
+    if video_track is None:
+        video_track = get_video_track(movie_path, "get_movie_duration")
+    duration = 0
+    if video_track is not None:
+        duration = float(video_track["duration"])
+    return duration
 
 
 def normalize_encoding(
@@ -184,12 +237,13 @@ def normalize_movie(movie_path, fps, width, height):
     Normalize movie using resolution, width and height given in parameter.
     Generates a high def movie and a low def movie.
     """
-    folder_path = os.path.dirname(movie_path)
     file_source_name = os.path.basename(movie_path)
     file_target_name = "%s.mp4" % file_source_name[:-8]
-    file_target_path = os.path.join(folder_path, file_target_name)
+    file_target_path = os.path.join(tempfile.gettempdir(), file_target_name)
     low_file_target_name = "%s_low.mp4" % file_source_name[:-8]
-    low_file_target_path = os.path.join(folder_path, low_file_target_name)
+    low_file_target_path = os.path.join(
+        tempfile.gettempdir(), low_file_target_name
+    )
 
     (w, h) = get_movie_size(movie_path)
     resize_factor = w / h
@@ -251,6 +305,12 @@ def add_empty_soundtrack(file_path, try_count=1):
     with contextlib.suppress(FileNotFoundError):
         os.remove(tmp_file_path)
 
+    duration = None
+    try:
+        probe = ffmpeg.probe(tmp_file_path, select_streams="v")
+        duration = probe["format"]["duration"]
+    except:
+        pass
     args = [
         "ffmpeg",
         "-hide_banner",
@@ -281,8 +341,32 @@ def add_empty_soundtrack(file_path, try_count=1):
 
     logger.info(f"add_empty_soundtrack.sp.returncode: {sp.returncode}")
     if sp.returncode == 0:
-        shutil.copyfile(tmp_file_path, file_path)
-        os.remove(tmp_file_path)
+        probe = ffmpeg.probe(tmp_file_path, select_streams="v")
+        new_duration = probe["format"]["duration"]
+
+        # Hack needed to fix duration after adding empty soundtrack due to a
+        # bug in ffmpeg which adds duplicated frames at the end of the movie.
+        if duration is not None and duration != new_duration:
+            tmp_file_path_trim = file_path + "_empty_audio_trim." + extension
+            stream = ffmpeg.input(tmp_file_path)
+            stream = ffmpeg.output(
+                stream.video,
+                stream.audio,
+                tmp_file_path_trim,
+                ss="00:00:00",
+                t=duration,
+                vcodec="copy",
+                acodec="copy",
+            )
+            stream.run(quiet=False, capture_stderr=True, overwrite_output=True)
+
+            shutil.copyfile(tmp_file_path_trim, file_path)
+            os.remove(tmp_file_path)
+            os.remove(tmp_file_path_trim)
+
+        else:
+            shutil.copyfile(tmp_file_path, file_path)
+            os.remove(tmp_file_path)
     else:
         logger.error(f"Err in soundtrack: {err}")
         logger.error(f"Err code: {sp.returncode}")
@@ -411,7 +495,11 @@ def concat_demuxer(in_files, output_path, *args):
 
         stream = ffmpeg.input(temp.name, format="concat", safe=0)
         stream = ffmpeg.output(
-            stream.video, stream.audio, output_path, c="copy"
+            stream.video,
+            stream.audio,
+            output_path,
+            vf="select=concatdec_select",
+            af="aselect=concatdec_select,aresample=async=1",
         )
         return run_ffmpeg(stream, "-xerror")
 

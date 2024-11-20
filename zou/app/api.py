@@ -8,6 +8,7 @@ from flask import Blueprint
 from zou.app.blueprints.assets import blueprint as assets_blueprint
 from zou.app.blueprints.auth import blueprint as auth_blueprint
 from zou.app.blueprints.breakdown import blueprint as breakdown_blueprint
+from zou.app.blueprints.chats import blueprint as chats_blueprint
 from zou.app.blueprints.comments import blueprint as comments_blueprint
 from zou.app.blueprints.crud import blueprint as crud_blueprint
 from zou.app.blueprints.entities import blueprint as entities_blueprint
@@ -26,6 +27,7 @@ from zou.app.blueprints.shots import blueprint as shots_blueprint
 from zou.app.blueprints.tasks import blueprint as tasks_blueprint
 from zou.app.blueprints.user import blueprint as user_blueprint
 from zou.app.blueprints.edits import blueprint as edits_blueprint
+from zou.app.blueprints.concepts import blueprint as concepts_blueprint
 
 
 def configure(app):
@@ -48,6 +50,7 @@ def configure_api_routes(app):
     app.register_blueprint(auth_blueprint)
     app.register_blueprint(assets_blueprint)
     app.register_blueprint(breakdown_blueprint)
+    app.register_blueprint(chats_blueprint)
     app.register_blueprint(comments_blueprint)
     app.register_blueprint(crud_blueprint)
     app.register_blueprint(entities_blueprint)
@@ -66,6 +69,7 @@ def configure_api_routes(app):
     app.register_blueprint(user_blueprint)
     app.register_blueprint(edits_blueprint)
     app.register_blueprint(search_blueprint)
+    app.register_blueprint(concepts_blueprint)
     return app
 
 

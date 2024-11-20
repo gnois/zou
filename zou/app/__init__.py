@@ -1,11 +1,17 @@
-import os
-import flask_fs
 import traceback
+import uuid
 
 from flask import Flask, jsonify, current_app
 from flasgger import Swagger
 from flask_jwt_extended import JWTManager
-from flask_principal import Principal, identity_changed, Identity
+from flask_principal import (
+    Principal,
+    Identity,
+    identity_changed,
+    RoleNeed,
+    UserNeed,
+    identity_loaded,
+)
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_mail import Mail
@@ -18,29 +24,34 @@ from meilisearch.errors import (
 )
 
 from zou.app import config, swagger
-from zou.app.stores import auth_tokens_store
+from zou.app.stores import auth_tokens_store, file_store
 from zou.app.services.exception import (
     ModelWithRelationsDeletionException,
     PersonNotFoundException,
     WrongIdFormatException,
     WrongParameterException,
     WrongTaskTypeForEntityException,
+    UnactiveUserException,
 )
 
-from zou.app.utils import cache, fs, logs
-from zou.app.utils.sentry import init_sentry
-from zou.app.utils.user_agent import ParsedUserAgent
+from zou.app.utils import cache, fs, logs, monitoring
+from zou.app.utils.flask import (
+    ParsedUserAgent,
+    ORJSONProvider,
+    wrong_auth_handler,
+)
 
-init_sentry()
+from zou.app.utils.saml import saml_client_for
+from zou.app.utils.fido import get_fido_server
+
 app = Flask(__name__)
+app.json = ORJSONProvider(app)
 app.request_class.user_agent_class = ParsedUserAgent
 app.config.from_object(config)
 
-logs.configure_logs(app)
+monitoring.init_monitoring(app)
 
-if not app.config["FILE_TREE_FOLDER"]:
-    # Default file_trees are included in Python package: use root_path
-    app.config["FILE_TREE_FOLDER"] = os.path.join(app.root_path, "file_trees")
+logs.configure_logs_ovh(app)
 
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)  # DB schema migration features
@@ -50,19 +61,16 @@ app.secret_key = app.config["SECRET_KEY"]
 jwt = JWTManager(app)  # JWT auth tokens
 Principal(app)  # Permissions
 cache.cache.init_app(app)  # Function caching
-flask_fs.init_app(app)  # To save files in object storage
 mail = Mail()
 mail.init_app(app)  # To send emails
 swagger = Swagger(
     app, template=swagger.swagger_template, config=swagger.swagger_config
 )
 
+if config.SAML_ENABLED:
+    app.extensions["saml_client"] = saml_client_for(config.SAML_METADATA_URL)
 
-if config.SENTRY_DEBUG_URL:
-
-    @app.route(config.SENTRY_DEBUG_URL)
-    def trigger_error():
-        division_by_zero = 1 / 0
+app.extensions["fido_server"] = get_fido_server()
 
 
 @app.teardown_appcontext
@@ -88,7 +96,7 @@ def id_parameter_format_error(error):
 
 @app.errorhandler(WrongParameterException)
 def wrong_parameter(error):
-    return jsonify(error=True, message=str(error)), 400
+    return jsonify(error=True, message=str(error), data=error.dict), 400
 
 
 @app.errorhandler(ExpiredSignatureError)
@@ -140,26 +148,83 @@ if not config.DEBUG:
 
 def configure_auth():
     from zou.app.services import persons_service
+    from zou.app.services.auth_service import logout
+
+    def check_active_identity(identity, identity_type, jti):
+        if not identity.active:
+            if identity_type == "person":
+                logout(jti=jti)
+            current_app.logger.error(
+                f"Identity {identity.id} is not active anymore"
+            )
+            raise UnactiveUserException
 
     @jwt.token_in_blocklist_loader
     def check_if_token_is_revoked(_, payload):
-        return auth_tokens_store.is_revoked(payload)
+        identity_type = payload.get("identity_type")
+        if identity_type == "person":
+            return auth_tokens_store.is_revoked(payload["jti"])
+        elif identity_type in ["bot", "person_api"]:
+            return persons_service.is_jti_revoked(payload["jti"])
+        else:
+            return True
 
     @jwt.user_lookup_loader
-    def add_permissions(_, payload):
+    def user_lookup_callback(_, payload):
+        identity_type = payload.get("identity_type")
         try:
-            user = persons_service.get_person(payload["user_id"])
-            if user is not None:
-                identity_changed.send(
-                    current_app._get_current_object(),
-                    identity=Identity(user["id"]),
-                )
-            return user
+            identity = persons_service.get_person_raw(payload["sub"])
         except PersonNotFoundException:
-            return None
+            return wrong_auth_handler()
+        check_active_identity(identity, identity_type, jti=payload["jti"])
+        identity_changed.send(
+            current_app._get_current_object(),
+            identity=Identity(identity.id, identity_type),
+        )
+        return identity
+
+    @identity_loaded.connect_via(app)
+    def on_identity_loaded(_, identity):
+        try:
+            if isinstance(identity.id, (str, uuid.UUID)):
+                identity.user = persons_service.get_person_raw(identity.id)
+
+                if hasattr(identity.user, "id"):
+                    identity.provides.add(UserNeed(identity.user.id))
+
+                if identity.user.role == "admin":
+                    identity.provides.add(RoleNeed("admin"))
+                    identity.provides.add(RoleNeed("manager"))
+
+                if identity.user.role == "manager":
+                    identity.provides.add(RoleNeed("manager"))
+
+                if identity.user.role == "supervisor":
+                    identity.provides.add(RoleNeed("supervisor"))
+
+                if identity.user.role == "client":
+                    identity.provides.add(RoleNeed("client"))
+
+                if identity.user.role == "vendor":
+                    identity.provides.add(RoleNeed("vendor"))
+
+                identity.provides.add(RoleNeed(identity.auth_type))
+
+            return identity
+
+        except Exception as e:
+            if isinstance(e, TimeoutError):
+                current_app.logger.error("Identity loading timed out")
+            if isinstance(e, (PersonNotFoundException, UnactiveUserException)):
+                pass
+            else:
+                current_app.logger.error(e, exc_info=1)
+                if hasattr(e, "message"):
+                    current_app.logger.error(e.message)
+            return wrong_auth_handler()
 
 
-def load_api():
+def load_api(app):
     from zou.app import api
 
     api.configure(app)
@@ -168,4 +233,5 @@ def load_api():
     configure_auth()
 
 
-load_api()
+file_store.configure_storages(app)
+load_api(app)

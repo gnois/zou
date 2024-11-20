@@ -3,7 +3,6 @@ from sqlalchemy_utils import UUIDType, ChoiceType
 from zou.app import db
 from zou.app.models.serializer import SerializerMixin
 from zou.app.models.base import BaseMixin
-from zou.app.utils import fields
 
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -69,6 +68,20 @@ class EntityLink(db.Model, BaseMixin, SerializerMixin):
             return entity_link, True
 
 
+class EntityConceptLink(db.Model, BaseMixin, SerializerMixin):
+    __tablename__ = "entity_concept_link"
+    entity_in_id = db.Column(
+        UUIDType(binary=False),
+        db.ForeignKey("entity.id"),
+        primary_key=True,
+    )
+    entity_out_id = db.Column(
+        UUIDType(binary=False),
+        db.ForeignKey("entity.id"),
+        primary_key=True,
+    )
+
+
 class Entity(db.Model, BaseMixin, SerializerMixin):
     """
     Base model to represent assets, shots, sequences, episodes and scenes.
@@ -76,13 +89,10 @@ class Entity(db.Model, BaseMixin, SerializerMixin):
     tasks and files.
     """
 
-    id = db.Column(
-        UUIDType(binary=False), primary_key=True, default=fields.gen_uuid
-    )
-
+    id = BaseMixin.id
     name = db.Column(db.String(160), nullable=False)
     code = db.Column(db.String(160))  # To store sanitized version of name
-    description = db.Column(db.String(1200))
+    description = db.Column(db.Text())
     shotgun_id = db.Column(db.Integer)
     canceled = db.Column(db.Boolean, default=False)
 
@@ -90,7 +100,11 @@ class Entity(db.Model, BaseMixin, SerializerMixin):
     nb_entities_out = db.Column(db.Integer, default=0)
     is_casting_standby = db.Column(db.Boolean, default=False)
 
-    status = db.Column(ChoiceType(ENTITY_STATUSES), default="running")
+    is_shared = db.Column(db.Boolean, default=False, nullable=False)
+
+    status = db.Column(
+        ChoiceType(ENTITY_STATUSES), default="running", nullable=False
+    )
 
     project_id = db.Column(
         UUIDType(binary=False),
@@ -127,12 +141,26 @@ class Entity(db.Model, BaseMixin, SerializerMixin):
         db.ForeignKey("task_type.id", name="fk_ready_for"),
     )
 
+    created_by = db.Column(
+        UUIDType(binary=False),
+        db.ForeignKey("person.id"),
+        nullable=True,
+    )
+
     entities_out = db.relationship(
         "Entity",
         secondary="entity_link",
         primaryjoin=(id == EntityLink.entity_in_id),
         secondaryjoin=(id == EntityLink.entity_out_id),
         backref="entities_in",
+    )
+
+    entity_concept_links = db.relationship(
+        "Entity",
+        secondary="entity_concept_link",
+        primaryjoin=(id == EntityConceptLink.entity_in_id),
+        secondaryjoin=(id == EntityConceptLink.entity_out_id),
+        lazy="joined",
     )
 
     instance_casting = db.relationship(
@@ -237,6 +265,19 @@ class Entity(db.Model, BaseMixin, SerializerMixin):
             data["entity_type_id"] = entity_type.id
 
         return (data, entity_ids)
+
+    def serialize(self, obj_type=None, relations=False, milliseconds=False):
+        serialized_instance = super(Entity, self).serialize(
+            obj_type=obj_type,
+            relations=relations,
+            milliseconds=milliseconds,
+        )
+        if obj_type == "Concept" and not relations:
+            serialized_instance["entity_concept_links"] = [
+                str(entity_concept_link.id)
+                for entity_concept_link in self.entity_concept_links
+            ]
+        return serialized_instance
 
 
 class EntityVersion(db.Model, BaseMixin, SerializerMixin):

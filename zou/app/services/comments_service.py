@@ -25,6 +25,8 @@ from zou.app.services import (
     persons_service,
     projects_service,
     tasks_service,
+    concepts_service,
+    preview_files_service,
 )
 from zou.app.services.exception import (
     AttachmentFileNotFoundException,
@@ -32,7 +34,7 @@ from zou.app.services.exception import (
     AssetNotFoundException,
 )
 
-from zou.app.utils import cache, date_helpers, events, fs, fields
+from zou.app.utils import cache, date_helpers, events, fs, fields, date_helpers
 from zou.app.stores import file_store
 from zou.app import config
 
@@ -68,10 +70,17 @@ def get_attachment_file_path(attachment_file):
 
 
 def create_comment(
-    person_id, task_id, task_status_id, text, checklist, files, created_at
+    person_id,
+    task_id,
+    task_status_id,
+    text,
+    checklist,
+    files,
+    created_at,
+    links=[],
 ):
     """
-    Create a new comment and related: news, notifications and events.
+    Create a new comment and related: news, notifications and events.
     """
     task = tasks_service.get_task_with_relations(task_id)
     task_status = tasks_service.get_task_status(task_status_id)
@@ -86,6 +95,7 @@ def create_comment(
         text=text,
         checklist=checklist,
         created_at=created_at,
+        links=links,
     )
     task, status_changed = _manage_status_change(task_status, task, comment)
     _manage_subscriptions(task, comment, status_changed)
@@ -126,41 +136,51 @@ def _get_comment_author(person_id):
 
 
 def _manage_status_change(task_status, task, comment):
-    status_changed = task_status["id"] != task["task_status_id"]
-    new_data = {
-        "task_status_id": task_status["id"],
-        "last_comment_date": comment["created_at"],
-    }
-    if status_changed:
-        if task_status["is_retake"]:
-            retake_count = task["retake_count"]
-            if retake_count is None or retake_count == "NoneType":
-                retake_count = 0
-            new_data["retake_count"] = retake_count + 1
+    is_last_comment = (
+        task["last_comment_date"] is None
+        or task["last_comment_date"] <= comment["created_at"]
+    )
+    if not is_last_comment:
+        status_changed = False
+        task = tasks_service.reset_task_data(task["id"])
+    else:
+        status_changed = task_status["id"] != task["task_status_id"]
+        new_data = {
+            "task_status_id": task_status["id"],
+            "last_comment_date": comment["created_at"],
+        }
+        if status_changed:
+            if task_status["is_retake"]:
+                retake_count = task["retake_count"]
+                if retake_count is None or retake_count == "NoneType":
+                    retake_count = 0
+                new_data["retake_count"] = retake_count + 1
 
-        if task_status["is_feedback_request"]:
-            new_data["end_date"] = datetime.datetime.utcnow()
+            if task_status["is_feedback_request"]:
+                new_data["end_date"] = date_helpers.get_utc_now_datetime()
 
-        if (
-            task_status["short_name"] == "wip"
-            and task["real_start_date"] is None
-        ):
-            new_data["real_start_date"] = datetime.datetime.utcnow()
+            if (
+                task_status["short_name"] == "wip"
+                and task["real_start_date"] is None
+            ):
+                new_data["real_start_date"] = datetime.datetime.now(
+                    datetime.timezone.utc
+                )
 
-    tasks_service.update_task(task["id"], new_data)
+        tasks_service.update_task(task["id"], new_data)
 
-    if status_changed:
-        events.emit(
-            "task:status-changed",
-            {
-                "task_id": task["id"],
-                "new_task_status_id": new_data["task_status_id"],
-                "previous_task_status_id": task["task_status_id"],
-                "person_id": comment["person_id"],
-            },
-            project_id=task["project_id"],
-        )
-    task.update(new_data)
+        if status_changed:
+            events.emit(
+                "task:status-changed",
+                {
+                    "task_id": task["id"],
+                    "new_task_status_id": new_data["task_status_id"],
+                    "previous_task_status_id": task["task_status_id"],
+                    "person_id": comment["person_id"],
+                },
+                project_id=task["project_id"],
+            )
+        task.update(new_data)
     return task, status_changed
 
 
@@ -168,17 +188,24 @@ def _manage_subscriptions(task, comment, status_changed):
     notifications_service.create_notifications_for_task_and_comment(
         task, comment, change=status_changed
     )
-    news_service.create_news_for_task_and_comment(
-        task, comment, created_at=comment["created_at"], change=status_changed
-    )
+    if (
+        entities_service.get_entity(task["entity_id"])["entity_type_id"]
+        != concepts_service.get_concept_type()["id"]
+    ):
+        news_service.create_news_for_task_and_comment(
+            task,
+            comment,
+            created_at=comment["created_at"],
+            change=status_changed,
+        )
 
 
 def _run_status_automation(automation, task, person_id):
-    is_automation_to_run = (
-        task["task_type_id"] == automation["in_task_type_id"]
-        and task["task_status_id"] == automation["in_task_status_id"]
-    )
-    if not is_automation_to_run:
+    if (
+        automation["archived"]
+        or task["task_type_id"] != automation["in_task_type_id"]
+        or task["task_status_id"] != automation["in_task_status_id"]
+    ):
         return
 
     priorities = projects_service.get_task_type_priority_map(
@@ -206,7 +233,7 @@ def _run_status_automation(automation, task, person_id):
             task_status = tasks_service.get_task_status(
                 automation["in_task_status_id"]
             )
-            create_comment(
+            new_comment = create_comment(
                 person_id,
                 task_to_update["id"],
                 automation["out_task_status_id"],
@@ -219,6 +246,31 @@ def _run_status_automation(automation, task, person_id):
                 {},
                 None,
             )
+            if automation["import_last_revision"]:
+                preview_file = (
+                    preview_files_service.get_last_preview_file_for_task(
+                        task["id"]
+                    )
+                )
+                preview_files = (
+                    preview_files_service.get_preview_files_for_revision(
+                        preview_file["task_id"], preview_file["revision"]
+                    )
+                )
+
+                for preview_file in preview_files:
+                    new_preview_file = (
+                        tasks_service.add_preview_file_to_comment(
+                            new_comment["id"],
+                            new_comment["person_id"],
+                            task_to_update["id"],
+                        )
+                    )
+
+                    preview_files_service.copy_preview_file_in_another_one(
+                        preview_file["id"], new_preview_file["id"]
+                    )
+
     elif automation["out_field_type"] == "ready_for":
         try:
             asset = assets_service.update_asset(
@@ -239,6 +291,7 @@ def new_comment(
     files={},
     checklist=[],
     created_at="",
+    links=[],
 ):
     """
     Create a new comment for given object (by default, it considers this object
@@ -253,8 +306,8 @@ def new_comment(
             )
         except ValueError:
             try:
-                created_at_date = fields.get_date_object(
-                    created_at, date_format="%Y-%m-%dT%H:%M:%S"
+                created_at_date = date_helpers.get_datetime_from_string(
+                    created_at
                 )
             except ValueError:
                 pass
@@ -269,6 +322,7 @@ def new_comment(
         checklist=checklist,
         text=text,
         created_at=created_at_date,
+        links=links,
     )
 
     comment = comment.serialize(relations=True)
@@ -278,24 +332,6 @@ def new_comment(
         {"comment_id": comment["id"], "task_id": task_id},
         project_id=task["project_id"],
     )
-    return comment
-
-
-def add_attachments_to_comment(comment, files):
-    """
-    Create an attachment entry and for each given uploaded files and tie it
-    to given comment.
-    """
-    comment["attachment_files"] = []
-    for uploaded_file in files.values():
-        try:
-            attachment_file = create_attachment(comment, uploaded_file)
-            comment["attachment_files"].append(attachment_file)
-        except IntegrityError:
-            attachment_file = create_attachment(
-                comment, uploaded_file, randomize=True
-            )
-            comment["attachment_files"].append(attachment_file)
     return comment
 
 
@@ -498,7 +534,7 @@ def get_comment_mentions(project_id, text):
     project = Project.get(project_id)
     mentions = []
     for person in project.team:
-        if re.search("@%s( |$)" % person.full_name(), text) is not None:
+        if re.search("@%s( |$)" % person.full_name, text) is not None:
             mentions.append(person)
     return mentions
 
@@ -527,3 +563,21 @@ def get_comment_department_mention_ids(project_id, text):
         str(mention.id)
         for mention in get_comment_department_mentions(project_id, text)
     ]
+
+
+def add_attachments_to_comment(comment, files):
+    """
+    Create an attachment entry and for each given uploaded files and tie it
+    to given comment.
+    """
+    comment["attachment_files"] = []
+    for uploaded_file in files.values():
+        try:
+            attachment_file = create_attachment(comment, uploaded_file)
+            comment["attachment_files"].append(attachment_file)
+        except IntegrityError:
+            attachment_file = create_attachment(
+                comment, uploaded_file, randomize=True
+            )
+            comment["attachment_files"].append(attachment_file)
+    return comment

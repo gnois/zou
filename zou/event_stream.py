@@ -4,15 +4,19 @@ monkey.patch_all()
 
 from flask import Flask, jsonify
 from flask_jwt_extended import (
-    get_jwt,
+    get_jwt_identity,
     jwt_required,
     verify_jwt_in_request,
     JWTManager,
 )
 from flask_socketio import SocketIO, disconnect, join_room, emit
+from flask_sqlalchemy import SQLAlchemy
+
 from zou.app import config
 from zou.app.stores import auth_tokens_store
-from zou.app.utils.sentry import init_sentry
+from zou.app.utils.monitoring import init_monitoring
+from zou.app.utils.flask import ORJSONProvider
+from zou.app.services import persons_service
 
 server_stats = {"nb_connections": 0}
 rooms_data = {}
@@ -82,7 +86,16 @@ def get_redis_url():
     redis_host = config.KEY_VALUE_STORE["host"]
     redis_port = config.KEY_VALUE_STORE["port"]
     db_index = config.KV_EVENTS_DB_INDEX
-    return "redis://%s:%s/%s" % (redis_host, redis_port, db_index)
+    redis_password = config.KEY_VALUE_STORE["password"]
+    if redis_password:
+        return "redis://:%s@%s:%s/%s" % (
+            redis_password,
+            redis_host,
+            redis_port,
+            db_index,
+        )
+    else:
+        return "redis://%s:%s/%s" % (redis_host, redis_port, db_index)
 
 
 # Routes
@@ -114,7 +127,7 @@ def set_application_routes(socketio, app):
     def disconnected():
         try:
             verify_jwt_in_request()
-            user_id = get_jwt()["user_id"]
+            user_id = get_jwt_identity()
             # needed to be able to clear empty rooms
             tmp_rooms_data = dict(rooms_data)
             for room_id in tmp_rooms_data:
@@ -159,7 +172,7 @@ def set_playlist_room_routes(socketio, app):
         When a person joins the review room, we notify all its members that a
         new person is added to the room.
         """
-        user_id = get_jwt()["user_id"]
+        user_id = get_jwt_identity()
         room, room_id = _get_room_from_data(data)
         if len(room["people"]) == 0:
             _update_room_playing_status(data, room)
@@ -170,7 +183,7 @@ def set_playlist_room_routes(socketio, app):
     @socketio.on("preview-room:leave", namespace="/events")
     @jwt_required()
     def on_leave(data):
-        user_id = get_jwt()["user_id"]
+        user_id = get_jwt_identity()
         room_id = data["playlist_id"]
         _leave_room(room_id, user_id)
 
@@ -214,9 +227,12 @@ def create_app():
     socketio = SocketIO(
         logger=True, cors_allowed_origins=[], cors_credentials=False
     )
-    init_sentry()
     app = Flask(__name__)
+    app.json = ORJSONProvider(app)
     app.config.from_object(config)
+    init_monitoring(app)
+    db = SQLAlchemy(app)
+    app.extensions["sqlalchemy"].db = db
     set_info_routes(socketio, app)
     set_application_routes(socketio, app)
     set_playlist_room_routes(socketio, app)
@@ -229,7 +245,13 @@ def set_auth(app):
 
     @jwt.token_in_blocklist_loader
     def check_if_token_is_revoked(_, payload):
-        return auth_tokens_store.is_revoked(payload)
+        identity_type = payload.get("identity_type")
+        if identity_type == "person":
+            return auth_tokens_store.is_revoked(payload["jti"])
+        elif identity_type in ["bot", "person_api"]:
+            return persons_service.is_jti_revoked(payload["jti"])
+        else:
+            return True
 
 
 (app, socketio) = create_app()

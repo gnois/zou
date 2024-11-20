@@ -9,13 +9,16 @@ from ipaddress import IPv4Address
 from sqlalchemy_utils.types.choice import Choice
 
 
-def serialize_value(value):
+def serialize_value(value, milliseconds=False):
     """
     Utility function to handle the normalizing of specific fields.
     The aim is to make the result JSON serializable
     """
     if isinstance(value, datetime.datetime):
-        return value.replace(microsecond=0).isoformat()
+        if milliseconds:
+            return value.isoformat()
+        else:
+            return value.replace(microsecond=0).isoformat()
     if isinstance(value, datetime.date):
         return value.isoformat()
     elif isinstance(value, uuid.UUID):
@@ -26,10 +29,6 @@ def serialize_value(value):
         return serialize_orm_arrays(value)
     elif isinstance(value, bytes):
         return value.decode("utf-8")
-    elif isinstance(value, str):
-        return value
-    elif isinstance(value, int):
-        return value
     elif isinstance(value, list):
         return serialize_list(value)
     elif isinstance(value, Locale):
@@ -56,7 +55,11 @@ def serialize_list(list_value):
     Serialize a list of any kind of objects into data structures
     that are JSON serializable.
     """
-    return [serialize_value(value) for value in list_value]
+    return (
+        list_value
+        if list_value is None
+        else [serialize_value(value) for value in list_value]
+    )
 
 
 def serialize_dict(dict_value):
@@ -78,12 +81,12 @@ def serialize_orm_arrays(array_value):
     return [serialize_value(val.id) for val in array_value]
 
 
-def serialize_models(models, relations=False):
+def serialize_models(models, relations=False, milliseconds=False):
     """
     Serialize a list of models (useful for json dumping)
     """
     return [
-        model.serialize(relations=relations)
+        model.serialize(relations=relations, milliseconds=milliseconds)
         for model in models
         if model is not None
     ]

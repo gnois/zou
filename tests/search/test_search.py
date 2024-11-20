@@ -1,5 +1,6 @@
 from tests.base import ApiDBTestCase
 
+
 from zou.app.services import index_service
 
 
@@ -35,7 +36,7 @@ class AssetSearchTestCase(ApiDBTestCase):
 
     def create_person_alicia(self):
         return self.post(
-            "data/persons/new",
+            "data/persons",
             {
                 "email": "alicia@cg-wire.com",
                 "first_name": "Alicia",
@@ -53,6 +54,12 @@ class AssetSearchTestCase(ApiDBTestCase):
     def test_search_assets_exact(self):
         assets = self.post("data/search", {"query": "rabbit"}, 200)["assets"]
         self.assertEqual(len(assets), 1)
+
+    def test_search_assets_not_allowed(self):
+        self.generate_fixture_user_manager()
+        self.log_in_manager()
+        assets = self.post("data/search", {"query": "rabbit"}, 200)["assets"]
+        self.assertEqual(len(assets), 0)
 
     def test_search_assets_partial(self):
         assets = self.post("data/search", {"query": "rab"}, 200)["assets"]
@@ -122,6 +129,12 @@ class AssetSearchTestCase(ApiDBTestCase):
         shots = self.post("data/search", {"query": "sh001"}, 200)["shots"]
         self.assertEqual(len(shots), 1)
 
+    def test_search_shots_not_allowed(self):
+        self.generate_fixture_user_manager()
+        self.log_in_manager()
+        assets = self.post("data/search", {"query": "sh001"}, 200)["shots"]
+        self.assertEqual(len(assets), 0)
+
     def test_search_shots_partial(self):
         shots = self.post("data/search", {"query": "sH00"}, 200)["shots"]
         self.assertEqual(len(shots), 1)
@@ -130,3 +143,37 @@ class AssetSearchTestCase(ApiDBTestCase):
         shots = self.post("data/search", {"query": "pl004"}, 200)["shots"]
         shots = self.post("data/search", {"query": "pl004"}, 200)["shots"]
         self.assertEqual(len(shots), 0)
+
+    def test_search_offset(self):
+        for i in range(1, 11):
+            self.generate_fixture_asset_character("Offset%s" % i)
+        index_service.reset_index()
+        assets = self.post(
+            "data/search",
+            {
+                "query": "Offset",
+                "limit": 4,
+            },
+            200,
+        )["assets"]
+        self.assertEqual(len(assets), 4)
+        assets = self.post(
+            "data/search",
+            {
+                "query": "Offset",
+                "limit": 4,
+                "offset": 4,
+            },
+            200,
+        )["assets"]
+        self.assertEqual(len(assets), 4)
+        assets = self.post(
+            "data/search",
+            {
+                "query": "Offset",
+                "limit": 4,
+                "offset": 8,
+            },
+            200,
+        )["assets"]
+        self.assertEqual(len(assets), 2)

@@ -13,22 +13,39 @@ from zou.app.services import (
     persons_service,
     tasks_service,
     user_service,
+    projects_service,
 )
 from zou.app.utils import events, permissions
 
 from zou.app.blueprints.crud.base import BaseModelResource, BaseModelsResource
 
-from zou.app.services.exception import CommentNotFoundException
+from zou.app.services.exception import (
+    CommentNotFoundException,
+)
 
 
 class CommentsResource(BaseModelsResource):
     def __init__(self):
         BaseModelsResource.__init__(self, Comment)
 
+    def check_read_permissions(self, options=None):
+        if options is not None:
+            if "project_id" in options:
+                user_service.check_project_access(options["project_id"])
+                if (
+                    permissions.has_vendor_permissions()
+                    or permissions.has_client_permissions()
+                ):
+                    raise permissions.PermissionDenied
+                else:
+                    return True
+        return permissions.check_admin_permissions()
+
 
 class CommentResource(BaseModelResource):
     def __init__(self):
         BaseModelResource.__init__(self, Comment)
+        self.protected_fields += ["mentions", "department_mentions"]
 
     @jwt_required()
     def get(self, instance_id):
@@ -75,7 +92,7 @@ class CommentResource(BaseModelResource):
             self.previous_task_status_id = instance_dict["task_status_id"]
         return data
 
-    def post_update(self, instance_dict):
+    def post_update(self, instance_dict, data):
         comment = comments_service.reset_mentions(instance_dict)
         if self.task_status_change:
             task_id = comment["object_id"]
@@ -102,9 +119,90 @@ class CommentResource(BaseModelResource):
         if permissions.has_admin_permissions():
             return True
         else:
-            comment = self.get_model_or_404(instance["id"])
-            current_user = persons_service.get_current_user()
-            return current_user["id"] == str(comment.person_id)
+            task = tasks_service.get_task(
+                instance["object_id"], relations=True
+            )
+            task_type = tasks_service.get_task_type(task["task_type_id"])
+            project = projects_service.get_project_with_relations(
+                task["project_id"]
+            )
+            current_user = persons_service.get_current_user(relations=True)
+            if current_user["id"] not in project["team"]:
+                raise permissions.PermissionDenied
+
+            if permissions.has_manager_permissions():
+                return True
+
+            change_pinned = (
+                "pinned" in data.keys()
+                and data["pinned"] != instance["pinned"]
+            )
+            change_checklist = (
+                "checklist" in data.keys()
+                and data["checklist"] != instance["checklist"]
+            )
+            is_supervisor = permissions.has_supervisor_permissions()
+            is_supervisor_in_department = (
+                current_user["departments"] == []
+                or task_type["department_id"] in current_user["departments"]
+            )
+            is_assigned = current_user["id"] in task["assignees"]
+            comment_from_current_user = (
+                current_user["id"] == instance["person_id"]
+            )
+
+            if change_pinned and (
+                not is_supervisor or not is_supervisor_in_department
+            ):
+                raise permissions.PermissionDenied
+
+            if change_checklist and (
+                not comment_from_current_user
+                and (
+                    (
+                        is_supervisor
+                        and not (is_supervisor_in_department or is_assigned)
+                    )
+                    or (not is_supervisor and not is_assigned)
+                )
+                and (
+                    len(data["checklist"]) == len(instance["checklist"])
+                    and all(
+                        all(
+                            (
+                                k == "checked"
+                                or data["checklist"][i].get(k) == c[k]
+                            )
+                            for k in c.keys()
+                        )
+                        for i, c in enumerate(instance["checklist"])
+                    )
+                )
+            ):
+                raise permissions.PermissionDenied
+
+            if (
+                not comment_from_current_user
+                and len(set(data.keys()) - set(["pinned", "checklist"])) > 0
+            ):
+                raise permissions.PermissionDenied
+
+            if (
+                "person_id" in data.keys()
+                and data["person_id"] != current_user["id"]
+            ):
+                raise permissions.PermissionDenied
+
+            if (
+                "object_id" in data.keys()
+                and data["object_id"] != instance["object_id"]
+            ):
+                raise permissions.PermissionDenied
+
+            if "task_status_id" in data.keys():
+                user_service.check_task_status_access(data["task_status_id"])
+
+            return True
 
     def pre_delete(self, comment):
         task = tasks_service.get_task(comment["object_id"])

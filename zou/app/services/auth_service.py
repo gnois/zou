@@ -2,13 +2,12 @@ import pyotp
 import random
 import string
 import flask_bcrypt
-import fido2.features
-from datetime import datetime, timedelta
 
-from flask import request, session
+from datetime import timedelta
+
+from flask import request, session, current_app
 from babel.dates import format_datetime
 
-from flask_jwt_extended import get_jti
 from ldap3 import Server, Connection, ALL, NTLM, SIMPLE
 from ldap3.core.exceptions import (
     LDAPSocketOpenError,
@@ -37,29 +36,14 @@ from zou.app.services.exception import (
 )
 from zou.app.stores import auth_tokens_store
 from zou.app.utils import date_helpers, emails
-from zou.app.models.person import Person
-from zou.app import config
 
 from fido2.webauthn import (
-    PublicKeyCredentialRpEntity,
     PublicKeyCredentialUserEntity,
 )
-from fido2.server import Fido2Server
 from sqlalchemy.orm.attributes import flag_modified
-from urllib.parse import urlparse
+
 from fido2.utils import bytes2int, int2bytes
 from fido2.webauthn import AttestedCredentialData
-
-fido2.features.webauthn_json_mapping.enabled = True
-
-fido_server = Fido2Server(
-    PublicKeyCredentialRpEntity(
-        name="Kitsu", id=urlparse(f"https://{config.DOMAIN_NAME}").hostname
-    ),
-    verify_origin=None
-    if config.DOMAIN_NAME != "localhost:8080"
-    else lambda a: True,
-)
 
 
 def check_auth(
@@ -83,7 +67,7 @@ def check_auth(
     if not email:
         raise WrongUserException()
     try:
-        person = persons_service.get_person_by_email_dekstop_login(email)
+        person = persons_service.get_person_by_email_desktop_login(email)
     except PersonNotFoundException:
         raise WrongUserException()
 
@@ -104,7 +88,9 @@ def check_auth(
             raise NoAuthStrategyConfigured()
     except WrongPasswordException:
         update_login_failed_attemps(
-            person["id"], login_failed_attemps + 1, datetime.utcnow()
+            person["id"],
+            login_failed_attemps + 1,
+            date_helpers.get_utc_now_datetime(),
         )
         raise WrongPasswordException()
 
@@ -117,7 +103,9 @@ def check_auth(
             recovery_code,
         ):
             update_login_failed_attemps(
-                person["id"], login_failed_attemps + 1, datetime.utcnow()
+                person["id"],
+                login_failed_attemps + 1,
+                date_helpers.get_utc_now_datetime(),
             )
             raise WrongOTPException()
 
@@ -180,7 +168,7 @@ def ldap_auth_strategy(person, password, app):
         try:
             SSL = app.config["LDAP_SSL"]
             if app.config["LDAP_IS_AD_SIMPLE"]:
-                user = f"CN={person['full_name']},{app.config['LDAP_BASE_DN']}"
+                user = f"cn={person['desktop_login']},{app.config['LDAP_BASE_DN']}"
                 authentication = SIMPLE
             elif app.config["LDAP_IS_AD"]:
                 user = (
@@ -222,23 +210,6 @@ def ldap_auth_strategy(person, password, app):
         return local_auth_strategy(person, password, app)
     else:
         raise UserCantConnectDueToNoFallback()
-
-
-def check_login_failed_attemps(person):
-    """
-    Checks that the person has not reached the failed login limit.
-    """
-    login_failed_attemps = person["login_failed_attemps"]
-    if login_failed_attemps is None:
-        login_failed_attemps = 0
-    if (
-        login_failed_attemps >= 5
-        and date_helpers.get_datetime_from_string(person["last_login_failed"])
-        + timedelta(minutes=1)
-        > datetime.utcnow()
-    ):
-        raise TooMuchLoginFailedAttemps()
-    return login_failed_attemps
 
 
 def update_login_failed_attemps(
@@ -359,7 +330,7 @@ def check_fido(person, authentication_response):
     except KeyError:
         return False
     try:
-        fido_server.authenticate_complete(
+        current_app.extensions["fido_server"].authenticate_complete(
             state,
             get_fido_attested_credential_data_from_person(
                 person["fido_credentials"],
@@ -506,7 +477,7 @@ def send_email_otp(person):
     )
     organisation = persons_service.get_organisation()
     time_string = format_datetime(
-        datetime.utcnow(),
+        date_helpers.get_utc_now_datetime(),
         tzinfo=person["timezone"],
         locale=person["locale"],
     )
@@ -565,11 +536,11 @@ def pre_register_fido(person_id):
     Pre-register FIDO device for a person.
     """
     person = Person.get(person_id)
-    options, state = fido_server.register_begin(
+    options, state = current_app.extensions["fido_server"].register_begin(
         PublicKeyCredentialUserEntity(
             id=str(person.id).encode(),
             name=person.email,
-            display_name=person.full_name(),
+            display_name=person.full_name,
         ),
         credentials=get_fido_attested_credential_data_from_person(
             person.fido_credentials
@@ -591,7 +562,9 @@ def register_fido(person_id, registration_response, device_name):
     except KeyError:
         raise FIDONoPreregistrationException()
     try:
-        auth_data = fido_server.register_complete(state, registration_response)
+        auth_data = current_app.extensions["fido_server"].register_complete(
+            state, registration_response
+        )
     except BaseException:
         raise FIDOServerException()
     credential_data = {
@@ -652,7 +625,7 @@ def get_challenge_fido(person_id):
     Get new FIDO challenge for a person.
     """
     person = Person.get(person_id)
-    options, state = fido_server.authenticate_begin(
+    options, state = current_app.extensions["fido_server"].authenticate_begin(
         credentials=get_fido_attested_credential_data_from_person(
             person.fido_credentials
         ),
@@ -689,23 +662,6 @@ def generate_new_recovery_codes(person_id):
     person.commit()
     persons_service.clear_person_cache()
     return otp_recovery_codes
-
-
-def register_tokens(app, access_token, refresh_token=None):
-    """
-    Register access and refresh tokens to auth token store. That way they
-    can be used like a session.
-    """
-    access_jti = get_jti(encoded_token=access_token)
-    auth_tokens_store.add(
-        access_jti, "false", app.config["JWT_ACCESS_TOKEN_EXPIRES"]
-    )
-
-    if refresh_token is not None:
-        refresh_jti = get_jti(encoded_token=refresh_token)
-        auth_tokens_store.add(
-            refresh_jti, "false", app.config["JWT_REFRESH_TOKEN_EXPIRES"]
-        )
 
 
 def revoke_tokens(app, jti):
@@ -771,7 +727,14 @@ def check_login_failed_attemps(person):
         login_failed_attemps >= 5
         and date_helpers.get_datetime_from_string(person["last_login_failed"])
         + timedelta(minutes=1)
-        > datetime.utcnow()
+        > date_helpers.get_utc_now_datetime()
     ):
         raise TooMuchLoginFailedAttemps()
     return login_failed_attemps
+
+
+def logout(jti):
+    try:
+        revoke_tokens(current_app, jti)
+    except Exception:
+        pass

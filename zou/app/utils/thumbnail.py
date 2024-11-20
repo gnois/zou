@@ -1,10 +1,15 @@
 import os
 import shutil
 import math
+import cv2
+import numpy
+
+from pathlib import Path
+
+from PIL import Image, ImageFile
 
 from zou.app.utils import fs
 
-from PIL import Image, ImageFile
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -13,6 +18,7 @@ RECTANGLE_SIZE = 150, 100
 SQUARE_SIZE = 100, 100
 PREVIEW_SIZE = 1200, 0
 BIG_SQUARE_SIZE = 400, 400
+BIG_RECTANGLE_SIZE = 300, 200
 
 
 def save_file(tmp_folder, instance_id, file_to_save):
@@ -35,10 +41,7 @@ def convert_jpg_to_png(file_source_path):
     """
     Convert .jpg file located at given path into a .png file with same name.
     """
-    folder_path = os.path.dirname(file_source_path)
-    file_source_name = os.path.basename(file_source_path)
-    file_target_name = "%s.png" % file_source_name[:-4]
-    file_target_path = os.path.join(folder_path, file_target_name)
+    file_target_path = Path(file_source_path).with_suffix(".png")
 
     im = Image.open(file_source_path)
     if im.mode == "CMYK":
@@ -73,7 +76,7 @@ def make_im_bigger_if_needed(im, size):
     return im
 
 
-def fit_to_target_size(im, size):
+def fit_to_target_size(im, size, crop=False):
     """
     Make sure that the image is contained in the size given in parameter
     (shorten width and/or height proporitionnally to expected ratio).
@@ -91,6 +94,14 @@ def fit_to_target_size(im, size):
             h = int(math.ceil(float(width) / original_ratio))
         im = im.resize((w, h), Image.Resampling.LANCZOS)
     return im
+
+
+def get_dimensions(file_path):
+    """
+    Return dimensions of given picture (width and height).
+    """
+    im = Image.open(file_path)
+    return im.size
 
 
 def turn_into_thumbnail(file_path, size=None):
@@ -120,11 +131,13 @@ def turn_into_thumbnail(file_path, size=None):
     return file_path
 
 
-def resize(file_path, size):
+def resize(file_path, size, crop=False):
     """
     Resize given picture
     """
     im = Image.open(file_path)
+    if crop:
+        im = prepare_image_for_thumbnail(im, size)
     im = im.resize(size, Image.Resampling.LANCZOS)
     if im.mode == "CMYK":
         im = im.convert("RGB")
@@ -202,3 +215,20 @@ def flat(*nums):
     Turn into an int tuple an a enumerable of numbers.
     """
     return tuple(int(round(n)) for n in nums)
+
+
+def turn_hdr_into_thumbnail(original_path, size=BIG_RECTANGLE_SIZE):
+    """
+    Turn an HDR file into a thumbnail.
+    """
+    file_target_path = Path(original_path).with_suffix(".png")
+    hdr = cv2.imread(original_path, flags=cv2.IMREAD_ANYDEPTH)
+    # Simply clamp values to a 0-1 range for tone-mapping
+    ldr = numpy.clip(hdr, 0, 1)
+    # Color space conversion
+    ldr = ldr ** (1 / 2.2)
+    # 0-255 remapping for bit-depth conversion
+    ldr = 255.0 * ldr
+    cv2.imwrite(str(file_target_path), ldr)
+    turn_into_thumbnail(file_target_path, size)
+    return file_target_path

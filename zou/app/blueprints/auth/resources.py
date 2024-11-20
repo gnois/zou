@@ -1,24 +1,37 @@
-import datetime
 import urllib.parse
 
-from flask import request, jsonify, abort, current_app
+from flask import request, jsonify, current_app, redirect, make_response
 from flask_restful import Resource
 from flask_principal import (
     Identity,
     AnonymousIdentity,
-    RoleNeed,
-    UserNeed,
     identity_changed,
-    identity_loaded,
+)
+from flask_jwt_extended import (
+    jwt_required,
+    create_access_token,
+    create_refresh_token,
+    set_access_cookies,
+    set_refresh_cookies,
+    unset_jwt_cookies,
+    get_jwt,
 )
 
 from sqlalchemy.exc import OperationalError, TimeoutError
 from babel.dates import format_datetime
+from saml2 import entity
 
 from zou.app import app, config
 from zou.app.mixin import ArgsMixin
-from zou.app.utils import auth, emails
-from zou.app.services import persons_service, auth_service, events_service
+from zou.app.utils import auth, emails, permissions, date_helpers
+from zou.app.services import (
+    persons_service,
+    auth_service,
+    events_service,
+)
+
+from zou.app.utils.flask import is_from_browser
+
 from zou.app.stores import auth_tokens_store
 from zou.app.services.exception import (
     EmailOTPAlreadyEnabledException,
@@ -39,94 +52,6 @@ from zou.app.services.exception import (
     WrongPasswordException,
     WrongUserException,
 )
-
-
-from flask_jwt_extended import (
-    jwt_required,
-    create_access_token,
-    create_refresh_token,
-    get_jwt_identity,
-    get_jwt,
-    set_access_cookies,
-    set_refresh_cookies,
-    unset_jwt_cookies,
-)
-
-
-def is_from_browser(user_agent):
-    return user_agent.browser in [
-        "Brave",
-        "Chrome",
-        "Edge",
-        "Firefox",
-        "Opera",
-        "Safari",
-        "Vivaldi",
-    ]
-
-
-def logout():
-    try:
-        current_token = get_jwt()
-        jti = current_token["jti"]
-        auth_service.revoke_tokens(app, jti)
-    except Exception:
-        pass
-
-
-def wrong_auth_handler(identity_user=None):
-    if request.path not in ["/auth/login", "/auth/logout"]:
-        abort(401)
-    else:
-        return identity_user
-
-
-@identity_loaded.connect_via(app)
-def on_identity_loaded(sender, identity):
-    if identity.id is not None:
-        from zou.app.services import persons_service
-
-        try:
-            identity.user = persons_service.get_person(identity.id)
-
-            if hasattr(identity.user, "id"):
-                identity.provides.add(UserNeed(identity.user["id"]))
-
-            if identity.user is None:
-                raise PersonNotFoundException
-
-            if identity.user["role"] == "admin":
-                identity.provides.add(RoleNeed("admin"))
-                identity.provides.add(RoleNeed("manager"))
-
-            if identity.user["role"] == "manager":
-                identity.provides.add(RoleNeed("manager"))
-
-            if identity.user["role"] == "supervisor":
-                identity.provides.add(RoleNeed("supervisor"))
-
-            if identity.user["role"] == "client":
-                identity.provides.add(RoleNeed("client"))
-
-            if identity.user["role"] == "vendor":
-                identity.provides.add(RoleNeed("vendor"))
-
-            if not identity.user["active"]:
-                current_app.logger.error("Current user is not active anymore")
-                logout()
-                return wrong_auth_handler(identity.user)
-
-            return identity
-        except PersonNotFoundException:
-            return wrong_auth_handler()
-        except TimeoutError:
-            current_app.logger.error("Identity loading timed out")
-            return wrong_auth_handler()
-        except Exception as exception:
-            current_app.logger.error(exception, exc_info=1)
-            if hasattr(exception, "message"):
-                current_app.logger.error(exception.message)
-            return wrong_auth_handler()
 
 
 class AuthenticatedResource(Resource):
@@ -152,18 +77,13 @@ class AuthenticatedResource(Resource):
           401:
             description: Person not found
         """
-        try:
-            person = persons_service.get_person_by_email(
-                get_jwt_identity(), relations=True
-            )
-            organisation = persons_service.get_organisation()
-            return {
-                "authenticated": True,
-                "user": person,
-                "organisation": organisation,
-            }
-        except PersonNotFoundException:
-            abort(401)
+        person = persons_service.get_current_user(relations=True)
+        organisation = persons_service.get_organisation()
+        return {
+            "authenticated": True,
+            "user": person,
+            "organisation": organisation,
+        }
 
 
 class LogoutResource(Resource):
@@ -173,6 +93,7 @@ class LogoutResource(Resource):
     """
 
     @jwt_required()
+    @permissions.require_person
     def get(self):
         """
         Log user out by revoking his auth tokens.
@@ -187,7 +108,7 @@ class LogoutResource(Resource):
             description: Access token not found
         """
         try:
-            logout()
+            auth_service.logout(get_jwt()["jti"])
             identity_changed.send(
                 current_app._get_current_object(), identity=AnonymousIdentity()
             )
@@ -286,17 +207,20 @@ class LoginResource(Resource, ArgsMixin):
                 )
 
             access_token = create_access_token(
-                identity=user["email"],
-                additional_claims={"user_id": user["id"]},
+                identity=user["id"],
+                additional_claims={
+                    "identity_type": "person",
+                },
             )
             refresh_token = create_refresh_token(
-                identity=user["email"],
-                additional_claims={"user_id": user["id"]},
+                identity=user["id"],
+                additional_claims={
+                    "identity_type": "person",
+                },
             )
-            auth_service.register_tokens(app, access_token, refresh_token)
             identity_changed.send(
                 current_app._get_current_object(),
-                identity=Identity(user["id"]),
+                identity=Identity(user["id"], "person"),
             )
 
             ip_address = request.environ.get(
@@ -315,7 +239,6 @@ class LoginResource(Resource, ArgsMixin):
                 set_access_cookies(response, access_token)
                 set_refresh_cookies(response, refresh_token)
                 events_service.create_login_log(user["id"], ip_address, "web")
-
             else:
                 events_service.create_login_log(
                     user["id"], ip_address, "script"
@@ -326,13 +249,13 @@ class LoginResource(Resource, ArgsMixin):
                     "access_token": access_token,
                     "refresh_token": refresh_token,
                 }
-
+            current_app.logger.info(f"User {email} is logged in.")
             return response
         except WrongUserException:
-            current_app.logger.info("User %s is not registered." % email)
+            current_app.logger.info(f"User {email} is not registered.")
             return {"login": False}, 400
         except WrongPasswordException:
-            current_app.logger.info("User %s gave a wrong password." % email)
+            current_app.logger.info(f"User {email} gave a wrong password.")
             return {"login": False}, 400
         except NoAuthStrategyConfigured:
             current_app.logger.info(
@@ -341,22 +264,26 @@ class LoginResource(Resource, ArgsMixin):
             return {"login": False}, 409
         except UserCantConnectDueToNoFallback:
             current_app.logger.info(
-                "User %s can't login due to no fallback from LDAP." % email
+                f"User {email} can't login due to no fallback from LDAP."
             )
             return {"login": False}, 400
         except TimeoutError:
             current_app.logger.info("Timeout occurs while logging in.")
             return {"login": False}, 400
         except UnactiveUserException:
+            current_app.logger.info(f"User {email} is unactive.")
             return (
                 {
                     "error": True,
                     "login": False,
-                    "message": "User is inactive, he cannot log in.",
+                    "message": "User is unactive, he cannot log in.",
                 },
-                400,
+                401,
             )
         except TooMuchLoginFailedAttemps:
+            current_app.logger.info(
+                f"User {email} can't log in due to too much login failed attemps."
+            )
             return (
                 {
                     "error": True,
@@ -366,6 +293,9 @@ class LoginResource(Resource, ArgsMixin):
                 400,
             )
         except MissingOTPException as e:
+            current_app.logger.info(
+                f"User {email} can't log in due to missing OTP."
+            )
             return (
                 {
                     "error": True,
@@ -377,6 +307,9 @@ class LoginResource(Resource, ArgsMixin):
                 400,
             )
         except WrongOTPException:
+            current_app.logger.info(
+                f"User {email} can't log in due to wrong OTP."
+            )
             return (
                 {
                     "error": True,
@@ -431,6 +364,7 @@ class LoginResource(Resource, ArgsMixin):
 
 class RefreshTokenResource(Resource):
     @jwt_required(refresh=True)
+    @permissions.require_person
     def get(self):
         """
         Tokens are considered as outdated every two weeks.
@@ -444,10 +378,11 @@ class RefreshTokenResource(Resource):
         """
         user = persons_service.get_current_user()
         access_token = create_access_token(
-            identity=user["email"],
-            additional_claims={"user_id": user["id"]},
+            identity=user["id"],
+            additional_claims={
+                "identity_type": "person",
+            },
         )
-        auth_service.register_tokens(app, access_token)
         if is_from_browser(request.user_agent):
             response = jsonify({"refresh": True})
             set_access_cookies(response, access_token)
@@ -576,6 +511,7 @@ class ChangePasswordResource(Resource, ArgsMixin):
     """
 
     @jwt_required()
+    @permissions.require_person
     def post(self):
         """
         Allow the user to change his password.
@@ -623,7 +559,7 @@ class ChangePasswordResource(Resource, ArgsMixin):
             )
             organisation = persons_service.get_organisation()
             time_string = format_datetime(
-                datetime.datetime.utcnow(),
+                date_helpers.get_utc_now_datetime(),
                 tzinfo=user["timezone"],
                 locale=user["locale"],
             )
@@ -743,11 +679,11 @@ class ResetPasswordResource(Resource, ArgsMixin):
             token_from_store = auth_tokens_store.get(
                 "reset-token-%s" % args["email"]
             )
-            auth_tokens_store.delete("reset-token-%s" % args["email"])
             if token_from_store == args["token"]:
                 auth.validate_password(args["password"], args["password2"])
                 password = auth.encrypt_password(args["password"])
                 persons_service.update_password(args["email"], password)
+                auth_tokens_store.delete("reset-token-%s" % args["email"])
                 current_app.logger.info(
                     "User %s has reset his password" % args["email"]
                 )
@@ -796,6 +732,11 @@ class ResetPasswordResource(Resource, ArgsMixin):
 
         try:
             user = persons_service.get_person_by_email(args["email"])
+            if not user["active"]:
+                return (
+                    {"error": True, "message": "This user is inactive."},
+                    400,
+                )
         except PersonNotFoundException:
             return (
                 {"error": True, "message": "Email not listed in database."},
@@ -814,7 +755,7 @@ class ResetPasswordResource(Resource, ArgsMixin):
             query,
         )
         time_string = format_datetime(
-            datetime.datetime.utcnow(),
+            date_helpers.get_utc_now_datetime(),
             tzinfo=user["timezone"],
             locale=user["locale"],
         )
@@ -850,6 +791,7 @@ class TOTPResource(Resource, ArgsMixin):
     """
 
     @jwt_required()
+    @permissions.require_person
     def put(self):
         """
         Resource to allow a user to pre-enable TOTP.
@@ -880,6 +822,7 @@ class TOTPResource(Resource, ArgsMixin):
             )
 
     @jwt_required()
+    @permissions.require_person
     def post(self):
         """
         Resource to allow a user to enable TOTP.
@@ -918,6 +861,7 @@ class TOTPResource(Resource, ArgsMixin):
             )
 
     @jwt_required()
+    @permissions.require_person
     def delete(self):
         """
         Resource to allow a user to disable TOTP.
@@ -1002,7 +946,7 @@ class EmailOTPResource(Resource, ArgsMixin):
 
         try:
             try:
-                person = persons_service.get_person_by_email_dekstop_login(
+                person = persons_service.get_person_by_email_desktop_login(
                     args["email"]
                 )
             except PersonNotFoundException:
@@ -1023,6 +967,7 @@ class EmailOTPResource(Resource, ArgsMixin):
             )
 
     @jwt_required()
+    @permissions.require_person
     def put(self):
         """
         Resource to allow a user to pre-enable OTP by email.
@@ -1050,6 +995,7 @@ class EmailOTPResource(Resource, ArgsMixin):
             )
 
     @jwt_required()
+    @permissions.require_person
     def post(self):
         """
         Resource to allow a user to enable OTP by email.
@@ -1069,7 +1015,8 @@ class EmailOTPResource(Resource, ArgsMixin):
 
         try:
             otp_recovery_codes = auth_service.enable_email_otp(
-                persons_service.get_current_user()["id"], args["email_otp"]
+                persons_service.get_current_user()["id"],
+                args["email_otp"],
             )
             return {"otp_recovery_codes": otp_recovery_codes}
         except EmailOTPAlreadyEnabledException:
@@ -1088,6 +1035,7 @@ class EmailOTPResource(Resource, ArgsMixin):
             )
 
     @jwt_required()
+    @permissions.require_person
     def delete(self):
         """
         Resource to allow a user to disable OTP by email.
@@ -1173,7 +1121,7 @@ class FIDOResource(Resource, ArgsMixin):
 
         try:
             try:
-                person = persons_service.get_person_by_email_dekstop_login(
+                person = persons_service.get_person_by_email_desktop_login(
                     args["email"]
                 )
             except PersonNotFoundException:
@@ -1193,6 +1141,7 @@ class FIDOResource(Resource, ArgsMixin):
             )
 
     @jwt_required()
+    @permissions.require_person
     def put(self):
         """
         Resource to allow a user to pre-register a FIDO device.
@@ -1212,6 +1161,7 @@ class FIDOResource(Resource, ArgsMixin):
             persons_service.get_current_user()["id"]
         )
 
+    @permissions.require_person
     @jwt_required()
     def post(self):
         """
@@ -1257,6 +1207,7 @@ class FIDOResource(Resource, ArgsMixin):
             )
 
     @jwt_required()
+    @permissions.require_person
     def delete(self):
         """
         Resource to allow a user to unregister a FIDO device.
@@ -1321,6 +1272,7 @@ class RecoveryCodesResource(Resource, ArgsMixin):
     """
 
     @jwt_required()
+    @permissions.require_person
     def put(self):
         """
         Resource to allow a user to generate new recovery codes.
@@ -1380,3 +1332,114 @@ class RecoveryCodesResource(Resource, ArgsMixin):
                 },
                 400,
             )
+
+
+class SAMLSSOResource(Resource, ArgsMixin):
+    """
+    Resource to allow a user to login with SAML SSO.
+    """
+
+    def post(self):
+        """
+        Resource to allow a user to login with SAML SSO.
+        ---
+        description: ""
+        tags:
+            - Authentication
+        responses:
+          302:
+            description: Login successful, redirect to the home page.
+          400:
+            description: Wrong parameter
+        """
+        if not config.SAML_ENABLED:
+            return {"error": "SAML is not enabled."}, 400
+        authn_response = current_app.extensions[
+            "saml_client"
+        ].parse_authn_request_response(
+            request.form["SAMLResponse"], entity.BINDING_HTTP_POST
+        )
+        authn_response.get_identity()
+        email = authn_response.get_subject().text
+        person_info = {
+            k: v if not isinstance(v, list) else " ".join(v)
+            for k, v in authn_response.ava.items()
+        }
+        try:
+            user = persons_service.get_person_by_email(email)
+            for k, v in person_info.items():
+                if user.get(k) != v:
+                    persons_service.update_person(
+                        user["id"], person_info, bypass_protected_accounts=True
+                    )
+                    break
+        except PersonNotFoundException:
+            user = persons_service.create_person(
+                email, "default".encode("utf-8"), **person_info
+            )
+
+        response = make_response(
+            redirect(f"{config.DOMAIN_PROTOCOL}://{config.DOMAIN_NAME}")
+        )
+
+        if user["active"]:
+            access_token = create_access_token(
+                identity=user["id"],
+                additional_claims={
+                    "identity_type": "person",
+                },
+            )
+            refresh_token = create_refresh_token(
+                identity=user["id"],
+                additional_claims={
+                    "identity_type": "person",
+                },
+            )
+            identity_changed.send(
+                current_app._get_current_object(),
+                identity=Identity(user["id"], "person"),
+            )
+
+            ip_address = request.environ.get(
+                "HTTP_X_REAL_IP", request.remote_addr
+            )
+
+            set_access_cookies(response, access_token)
+            set_refresh_cookies(response, refresh_token)
+            events_service.create_login_log(user["id"], ip_address, "web")
+
+        return response
+
+
+class SAMLLoginResource(Resource, ArgsMixin):
+    """
+    Resource to allow a user to login with SAML SSO.
+    """
+
+    def get(self):
+        """
+        Resource to allow a user to login with SAML SSO.
+        ---
+        description: ""
+        tags:
+            - Authentication
+        responses:
+          302:
+            description: Redirect to the SAML IDP.
+          400:
+            description: Wrong parameter.
+        """
+        if not config.SAML_ENABLED:
+            return {"error": "SAML is not enabled."}, 400
+        _, info = current_app.extensions[
+            "saml_client"
+        ].prepare_for_authenticate()
+
+        redirect_url = None
+
+        # Select the IdP URL to send the AuthN request to
+        for key, value in info["headers"]:
+            if key == "Location":
+                redirect_url = value
+
+        return redirect(redirect_url, code=302)

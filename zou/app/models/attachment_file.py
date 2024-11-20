@@ -15,11 +15,16 @@ class AttachmentFile(db.Model, BaseMixin, SerializerMixin):
     extension = db.Column(db.String(6))
     mimetype = db.Column(db.String(255))
     comment_id = db.Column(
-        UUIDType(binary=False), db.ForeignKey("comment.id"), index=True
+        UUIDType(binary=False),
+        db.ForeignKey("comment.id"),
+        index=True,
+        nullable=True,
     )
-
-    __table_args__ = (
-        db.UniqueConstraint("name", "comment_id", name="attachment_uc"),
+    chat_message_id = db.Column(
+        UUIDType(binary=False),
+        db.ForeignKey("chat_message.id"),
+        index=True,
+        nullable=True,
     )
 
     def __repr__(self):
@@ -37,6 +42,7 @@ class AttachmentFile(db.Model, BaseMixin, SerializerMixin):
     def create_from_import(cls, data):
         data.pop("type", None)
         data.pop("comment", None)
+        data.pop("chat_message", None)
         previous_data = cls.get(data["id"])
         if previous_data is None:
             return cls.create(**data)

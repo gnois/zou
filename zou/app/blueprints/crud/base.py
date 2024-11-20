@@ -1,5 +1,5 @@
 import math
-import json
+import orjson as json
 import sqlalchemy.orm as orm
 
 from flask import request, abort, current_app
@@ -7,11 +7,12 @@ from flask_restful import Resource
 from flask_jwt_extended import jwt_required
 
 from sqlalchemy.exc import IntegrityError, StatementError
+from sqlalchemy.inspection import inspect
 
 from zou.app.mixin import ArgsMixin
 from zou.app.utils import events, fields, permissions, query
 from zou.app.services.exception import (
-    ArgumentsException,
+    WrongParameterException,
     WrongParameterException,
 )
 
@@ -20,6 +21,7 @@ class BaseModelsResource(Resource, ArgsMixin):
     def __init__(self, model):
         Resource.__init__(self)
         self.model = model
+        self.protected_fields = ["id", "created_at", "updated_at"]
 
     def all_entries(self, query=None, relations=False):
         if query is None:
@@ -33,7 +35,11 @@ class BaseModelsResource(Resource, ArgsMixin):
         offset = (page - 1) * limit
 
         nb_pages = int(math.ceil(total / float(limit)))
-        query = query.order_by(self.model.updated_at.desc())
+        query = query.order_by(
+            self.model.updated_at.desc(),
+            self.model.created_at.desc(),
+            self.model.id,
+        )
         query = query.limit(limit)
         query = query.offset(offset)
 
@@ -63,16 +69,21 @@ class BaseModelsResource(Resource, ArgsMixin):
         name_filter = []
         filters = {}
 
-        column_names = [column.name for column in self.model.__table__.columns]
+        column_names = inspect(self.model).all_orm_descriptors.keys()
         for key, value in options.items():
             if key not in ["page", "relations"] and key in column_names:
                 field_key = getattr(self.model, key)
-                expr = field_key.property
 
-                is_many_to_many_field = isinstance(
-                    expr, orm.properties.RelationshipProperty
+                is_many_to_many_field = hasattr(
+                    field_key, "property"
+                ) and isinstance(
+                    field_key.property, orm.properties.RelationshipProperty
                 )
-                value_is_list = len(value) > 0 and value[0] == "["
+                value_is_list = (
+                    hasattr(value, "__len__")
+                    and len(value) > 0
+                    and value[0] == "["
+                )
 
                 if key == "name" and field_key is not None:
                     name_filter.append(value)
@@ -116,7 +127,7 @@ class BaseModelsResource(Resource, ArgsMixin):
 
         return query
 
-    def check_read_permissions(self):
+    def check_read_permissions(self, options=None):
         return permissions.check_admin_permissions()
 
     def add_project_permission_filter(self, query):
@@ -129,6 +140,9 @@ class BaseModelsResource(Resource, ArgsMixin):
         return data
 
     def update_data(self, data):
+        for field in self.protected_fields:
+            if (data is not None) and field in data:
+                data.pop(field, None)
         return data
 
     def post_creation(self, instance):
@@ -151,13 +165,14 @@ class BaseModelsResource(Resource, ArgsMixin):
                 description: Permission denied
         """
         try:
-            self.check_read_permissions()
             query = self.model.query
             if not request.args:
+                self.check_read_permissions()
                 query = self.add_project_permission_filter(query)
                 return self.all_entries(query)
             else:
                 options = request.args
+                self.check_read_permissions(options)
                 query = self.apply_filters(query, options)
                 query = self.add_project_permission_filter(query)
                 page = int(options.get("page", "-1"))
@@ -223,7 +238,7 @@ class BaseModelsResource(Resource, ArgsMixin):
         try:
             data = request.json
             if data is None:
-                raise ArgumentsException(
+                raise WrongParameterException(
                     "Data are empty. Please verify that you sent JSON data and"
                     " that you set the right headers."
                 )
@@ -235,21 +250,22 @@ class BaseModelsResource(Resource, ArgsMixin):
             self.emit_create_event(instance_dict)
             return instance_dict, 201
 
-        except TypeError as exception:
+        except (
+            TypeError,
+            IntegrityError,
+            StatementError,
+            KeyError,
+        ) as exception:
             current_app.logger.error(str(exception), exc_info=1)
             return {"message": str(exception)}, 400
 
-        except IntegrityError as exception:
+        except WrongParameterException as exception:
             current_app.logger.error(str(exception), exc_info=1)
-            return {"message": str(exception)}, 400
-
-        except StatementError as exception:
-            current_app.logger.error(str(exception), exc_info=1)
-            return {"message": str(exception)}, 400
-
-        except ArgumentsException as exception:
-            current_app.logger.error(str(exception), exc_info=1)
-            return {"message": str(exception)}, 400
+            return (
+                exception.dict
+                if exception.dict is not None
+                else {"message": str(exception)}
+            ), 400
 
     def emit_create_event(self, instance_dict):
         return events.emit(
@@ -259,7 +275,7 @@ class BaseModelsResource(Resource, ArgsMixin):
         )
 
 
-class BaseModelResource(Resource):
+class BaseModelResource(Resource, ArgsMixin):
     def __init__(self, model):
         Resource.__init__(self)
         self.protected_fields = ["id", "created_at", "updated_at"]
@@ -274,13 +290,13 @@ class BaseModelResource(Resource):
             abort(404)
         return instance
 
-    def check_read_permissions(self, instance):
+    def check_read_permissions(self, instance_dict):
         return permissions.check_admin_permissions()
 
-    def check_update_permissions(self, instance, data):
+    def check_update_permissions(self, instance_dict, data):
         return permissions.check_admin_permissions()
 
-    def check_delete_permissions(self, instance):
+    def check_delete_permissions(self, instance_dict):
         return permissions.check_admin_permissions()
 
     def get_arguments(self):
@@ -292,8 +308,8 @@ class BaseModelResource(Resource):
                 data.pop(field, None)
         return data
 
-    def serialize_instance(self, data):
-        return data.serialize(relations=True)
+    def serialize_instance(self, data, relations=True):
+        return data.serialize(relations=relations)
 
     def clean_get_result(self, data):
         return data
@@ -320,9 +336,10 @@ class BaseModelResource(Resource):
             404:
                 description: Value error
         """
+        relations = self.get_bool_parameter("relations", "true")
         try:
             instance = self.get_model_or_404(instance_id)
-            result = self.serialize_instance(instance)
+            result = self.serialize_instance(instance, relations=relations)
             self.check_read_permissions(result)
             result = self.clean_get_result(result)
 
@@ -338,7 +355,7 @@ class BaseModelResource(Resource):
     def pre_update(self, instance_dict, data):
         return data
 
-    def post_update(self, instance_dict):
+    def post_update(self, instance_dict, data):
         return instance_dict
 
     def post_delete(self, instance_dict):
@@ -390,7 +407,7 @@ class BaseModelResource(Resource):
         try:
             data = self.get_arguments()
             if data is None:
-                raise ArgumentsException(
+                raise WrongParameterException(
                     "Data are empty. Please verify that you sent JSON data and"
                     " that you set the right headers."
                 )
@@ -401,25 +418,25 @@ class BaseModelResource(Resource):
             data = self.update_data(data, instance_id)
             self.instance.update(data)
             instance_dict = self.instance.serialize()
+            self.post_update(instance_dict, data)
             self.emit_update_event(instance_dict)
-            self.post_update(instance_dict)
             return instance_dict, 200
 
-        except TypeError as exception:
+        except (
+            TypeError,
+            IntegrityError,
+            StatementError,
+        ) as exception:
             current_app.logger.error(str(exception), exc_info=1)
             return {"message": str(exception)}, 400
 
-        except IntegrityError as exception:
+        except WrongParameterException as exception:
             current_app.logger.error(str(exception), exc_info=1)
-            return {"message": str(exception)}, 400
-
-        except StatementError as exception:
-            current_app.logger.error(str(exception), exc_info=1)
-            return {"message": str(exception)}, 400
-
-        except ArgumentsException as exception:
-            current_app.logger.error(str(exception), exc_info=1)
-            return {"message": str(exception)}, 400
+            return (
+                exception.dict
+                if exception.dict is not None
+                else {"message": str(exception)}
+            ), 400
 
     @jwt_required()
     def delete(self, instance_id):

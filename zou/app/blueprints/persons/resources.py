@@ -15,109 +15,26 @@ from zou.app.services import (
     shots_service,
     user_service,
 )
-from zou.app.utils import permissions, csv_utils, auth, emails, fields
+from zou.app.utils import (
+    permissions,
+    csv_utils,
+    auth,
+    emails,
+    fields,
+    date_helpers,
+)
 from zou.app.services.exception import (
     DepartmentNotFoundException,
     WrongDateFormatException,
     WrongParameterException,
     UnactiveUserException,
     TwoFactorAuthenticationNotEnabledException,
+    PersonInProtectedAccounts,
+    WrongParameterException,
 )
 from zou.app.services.auth_service import (
     disable_two_factor_authentication_for_person,
 )
-
-
-class NewPersonResource(Resource, ArgsMixin):
-    """
-    Create a new user in the database.
-    """
-
-    @jwt_required()
-    def post(self):
-        """
-        Create a new user in the database.
-        ---
-        tags:
-        - Persons
-        description: Set password to None if not provided.
-                     User role can be set but only admins can create admin users.
-        parameters:
-          - in: formData
-            name: email
-            required: True
-            type: string
-            format: email
-            x-example: admin@example.com
-          - in: formData
-            name: phone
-            required: False
-            type: integer
-            x-example: 06 12 34 56 78
-          - in: formData
-            name: role
-            required: False
-            type: string
-            x-example: user
-          - in: formData
-            name: first_name
-            required: True
-            type: string
-          - in: formData
-            name: last_name
-            required: False
-            type: string
-        responses:
-            201:
-                description: User created
-        """
-        permissions.check_admin_permissions()
-        data = self.get_arguments()
-
-        if persons_service.is_user_limit_reached():
-            return {
-                "error": True,
-                "message": "User limit reached.",
-                "limit": config.USER_LIMIT,
-            }, 400
-        else:
-            if data["password"] is not None:
-                data["password"] = auth.encrypt_password(data["password"])
-            person = persons_service.create_person(
-                data["email"],
-                data["password"],
-                data["first_name"],
-                data["last_name"],
-                data["phone"],
-                role=data["role"],
-                desktop_login=data["desktop_login"],
-                departments=data["departments"],
-            )
-        return person, 201
-
-    def get_arguments(self):
-        args = self.get_args(
-            [
-                {
-                    "name": "email",
-                    "help": "The email is required.",
-                    "required": True,
-                },
-                {
-                    "name": "first_name",
-                    "help": "The first name is required.",
-                    "required": True,
-                },
-                ("last_name", ""),
-                ("phone", ""),
-                ("role", "user"),
-                ("desktop_login", ""),
-                {"name": "departments", "action": "append"},
-                "password",
-            ]
-        )
-
-        return args
 
 
 class DesktopLoginsResource(Resource, ArgsMixin):
@@ -180,7 +97,7 @@ class DesktopLoginsResource(Resource, ArgsMixin):
             201:
                 description: Desktop login log entry created.
         """
-        args = self.get_args([("date", datetime.datetime.utcnow())])
+        args = self.get_args([("date", date_helpers.get_utc_now_datetime())])
 
         current_user = persons_service.get_current_user()
         if (
@@ -235,6 +152,7 @@ class TimeSpentsResource(Resource, ArgsMixin):
 
     @jwt_required()
     def get(self, person_id):
+        user_service.check_person_is_not_bot(person_id)
         permissions.check_admin_permissions()
         arguments = self.get_args(["start_date", "end_date"])
         start_date, end_date = arguments["start_date"], arguments["end_date"]
@@ -292,6 +210,7 @@ class DateTimeSpentsResource(Resource):
             404:
                 description: Wrong date format
         """
+        user_service.check_person_is_not_bot(person_id)
         department_ids = None
         project_ids = None
         if not permissions.has_admin_permissions():
@@ -352,6 +271,7 @@ class DayOffResource(Resource):
             404:
                 description: Wrong date format
         """
+        user_service.check_person_is_not_bot(person_id)
         current_user = persons_service.get_current_user()
         if current_user["id"] != person_id:
             try:
@@ -388,7 +308,7 @@ class PersonDurationTimeSpentsResource(Resource, ArgsMixin):
                         raise permissions.PermissionDenied
                     if permissions.has_supervisor_permissions():
                         department_ids = persons_service.get_current_user(
-                            True
+                            relations=True
                         )["departments"]
                 else:
                     raise permissions.PermissionDenied
@@ -429,6 +349,7 @@ class PersonYearTimeSpentsResource(PersonDurationTimeSpentsResource):
             404:
                 description: Wrong date format
         """
+        user_service.check_person_is_not_bot(person_id)
         try:
             return time_spents_service.get_year_time_spents(
                 person_id,
@@ -476,6 +397,7 @@ class PersonMonthTimeSpentsResource(PersonDurationTimeSpentsResource):
             404:
                 description: Wrong date format
         """
+        user_service.check_person_is_not_bot(person_id)
         try:
             return time_spents_service.get_month_time_spents(
                 person_id,
@@ -494,6 +416,7 @@ class PersonMonthAllTimeSpentsResource(Resource):
 
     @jwt_required()
     def get(self, person_id, year, month):
+        user_service.check_person_is_not_bot(person_id)
         user_service.check_person_access(person_id)
         try:
             timespents = time_spents_service.get_time_spents_for_month(
@@ -541,6 +464,7 @@ class PersonWeekTimeSpentsResource(PersonDurationTimeSpentsResource):
             404:
                 description: Wrong date format
         """
+        user_service.check_person_is_not_bot(person_id)
         try:
             return time_spents_service.get_week_time_spents(
                 person_id,
@@ -596,6 +520,7 @@ class PersonDayTimeSpentsResource(PersonDurationTimeSpentsResource):
             404:
                 description: Wrong date format
         """
+        user_service.check_person_is_not_bot(person_id)
         try:
             return time_spents_service.get_day_time_spents(
                 person_id,
@@ -608,7 +533,24 @@ class PersonDayTimeSpentsResource(PersonDurationTimeSpentsResource):
             abort(404)
 
 
-class PersonMonthQuotaShotsResource(Resource, ArgsMixin):
+class PersonQuotaMixin:
+
+    def get_quota_arguments(self):
+        project_id = self.get_project_id()
+        task_type_id = self.get_task_type_id()
+        count_mode = self.get_text_parameter("count_mode", default="weigthed")
+        if count_mode not in ["weighted", "weighteddone", "feedback", "done"]:
+            raise WrongParameterException(
+                "count_mode must be equal to weighted, weigtheddone, feedback"
+                ", or done"
+            )
+        feedback = "done" not in count_mode
+        weighted = "weighted" in count_mode
+
+        return (project_id, task_type_id, count_mode, feedback, weighted)
+
+
+class PersonMonthQuotaShotsResource(Resource, ArgsMixin, PersonQuotaMixin):
     """
     Get ended shots used for quota calculation of this month.
     """
@@ -639,16 +581,24 @@ class PersonMonthQuotaShotsResource(Resource, ArgsMixin):
             x-example: 07
             minimum: 1
             maximum: 12
+          - in: query
+            name: count_mode
+            required: True
+            type: string
+            enum: [weighted, weigtheddone, feedback, done]
+            x-example: weighted
         responses:
             200:
                 description: Ended shots used for quota calculation of this month
             404:
                 description: Wrong date format
         """
-        project_id = self.get_project_id()
-        task_type_id = self.get_task_type_id()
+        user_service.check_person_is_not_bot(person_id)
         user_service.check_person_access(person_id)
-        weighted = self.get_bool_parameter("weighted", default="true")
+        (project_id, task_type_id, count_mode, feedback, weighted) = (
+            self.get_quota_arguments()
+        )
+
         try:
             return shots_service.get_month_quota_shots(
                 person_id,
@@ -657,12 +607,13 @@ class PersonMonthQuotaShotsResource(Resource, ArgsMixin):
                 project_id=project_id,
                 task_type_id=task_type_id,
                 weighted=weighted,
+                feedback=feedback,
             )
         except WrongDateFormatException:
             abort(404)
 
 
-class PersonWeekQuotaShotsResource(Resource, ArgsMixin):
+class PersonWeekQuotaShotsResource(Resource, ArgsMixin, PersonQuotaMixin):
     """
     Get ended shots used for quota calculation of this week.
     """
@@ -693,16 +644,24 @@ class PersonWeekQuotaShotsResource(Resource, ArgsMixin):
             x-example: 35
             minimum: 1
             maximum: 52
+          - in: query
+            name: count_mode
+            required: True
+            type: string
+            enum: [weighted, weigtheddone, feedback, done]
+            x-example: weighted
         responses:
             200:
                 description: Ended shots used for quota calculation of this week
             404:
                 description: Wrong date format
         """
-        project_id = self.get_project_id()
-        task_type_id = self.get_task_type_id()
+        user_service.check_person_is_not_bot(person_id)
         user_service.check_person_access(person_id)
-        weighted = self.get_bool_parameter("weighted", default="true")
+        (project_id, task_type_id, count_mode, feedback, weighted) = (
+            self.get_quota_arguments()
+        )
+
         try:
             return shots_service.get_week_quota_shots(
                 person_id,
@@ -711,12 +670,13 @@ class PersonWeekQuotaShotsResource(Resource, ArgsMixin):
                 project_id=project_id,
                 task_type_id=task_type_id,
                 weighted=weighted,
+                feedback=feedback,
             )
         except WrongDateFormatException:
             abort(404)
 
 
-class PersonDayQuotaShotsResource(Resource, ArgsMixin):
+class PersonDayQuotaShotsResource(Resource, ArgsMixin, PersonQuotaMixin):
     """
     Get ended shots used for quota calculation of this day.
     """
@@ -754,16 +714,24 @@ class PersonDayQuotaShotsResource(Resource, ArgsMixin):
             x-example: 12
             minimum: 1
             maximum: 31
+          - in: query
+            name: count_mode
+            required: True
+            type: string
+            enum: [weighted, weigtheddone, feedback, done]
+            x-example: weighted
         responses:
             200:
                 description: Ended shots used for quota calculation of this day
             404:
                 description: Wrong date format
         """
-        project_id = self.get_project_id()
-        task_type_id = self.get_task_type_id()
+        user_service.check_person_is_not_bot(person_id)
         user_service.check_person_access(person_id)
-        weighted = self.get_bool_parameter("weighted", default="true")
+        (project_id, task_type_id, count_mode, feedback, weighted) = (
+            self.get_quota_arguments()
+        )
+
         try:
             return shots_service.get_day_quota_shots(
                 person_id,
@@ -773,6 +741,7 @@ class PersonDayQuotaShotsResource(Resource, ArgsMixin):
                 project_id=project_id,
                 task_type_id=task_type_id,
                 weighted=weighted,
+                feedback=feedback,
             )
         except WrongDateFormatException:
             abort(404)
@@ -786,7 +755,12 @@ class TimeSpentDurationResource(Resource, ArgsMixin):
     def get_person_project_department_arguments(self):
         project_id = self.get_project_id()
         person_id = None
-        department_ids = None
+        department_id = self.get_text_parameter("department_id")
+        if department_id is not None:
+            department_ids = [department_id]
+        else:
+            department_ids = None
+        studio_id = self.get_text_parameter("studio_id")
         if not permissions.has_admin_permissions():
             if (
                 permissions.has_manager_permissions()
@@ -800,9 +774,16 @@ class TimeSpentDurationResource(Resource, ArgsMixin):
                 elif project_id not in project_ids:
                     raise permissions.PermissionDenied
                 if permissions.has_supervisor_permissions():
-                    department_ids = persons_service.get_current_user(
+                    persons_departments = persons_service.get_current_user(
                         relations=True
                     )["departments"]
+                    if department_id is not None:
+                        if department_id not in persons_departments:
+                            raise WrongParameterException(
+                                "Supervisor not allowed to access this department"
+                            )
+                    else:
+                        department_ids = persons_departments
             else:
                 person_id = persons_service.get_current_user()["id"]
 
@@ -810,6 +791,7 @@ class TimeSpentDurationResource(Resource, ArgsMixin):
             "person_id": person_id,
             "project_id": project_id,
             "department_ids": department_ids,
+            "studio_id": studio_id,
         }
 
 
@@ -947,6 +929,7 @@ class InvitePersonResource(Resource):
             200:
                 description: Email sent
         """
+        user_service.check_person_is_not_bot(person_id)
         permissions.check_admin_permissions()
         persons_service.invite_person(person_id)
         return {"success": True, "message": "Email sent"}
@@ -1025,6 +1008,7 @@ class PersonWeekDayOffResource(Resource, ArgsMixin):
             200:
                 description: All day off recorded for given week and person
         """
+        user_service.check_person_is_not_bot(person_id)
         user_id = persons_service.get_current_user()["id"]
         if person_id != user_id:
             permissions.check_admin_permissions()
@@ -1068,6 +1052,7 @@ class PersonMonthDayOffResource(Resource, ArgsMixin):
             200:
                 description: All day off recorded for given month and person
         """
+        user_service.check_person_is_not_bot(person_id)
         user_id = persons_service.get_current_user()["id"]
         if person_id != user_id:
             permissions.check_admin_permissions()
@@ -1104,11 +1089,44 @@ class PersonYearDayOffResource(Resource, ArgsMixin):
             200:
                 description: All day off recorded for given year and person
         """
+        user_service.check_person_is_not_bot(person_id)
         user_id = persons_service.get_current_user()["id"]
         if person_id != user_id:
             permissions.check_admin_permissions()
         return time_spents_service.get_person_day_offs_for_year(
             person_id, year
+        )
+
+
+class PersonDayOffResource(Resource, ArgsMixin):
+    """
+    Return all day offs recorded for given and person.
+    """
+
+    @jwt_required()
+    def get(self, person_id):
+        """
+        Return all day offs recorded for given and person.
+        ---
+        tags:
+        - Persons
+        parameters:
+          - in: path
+            name: person_id
+            required: True
+            type: string
+            format: UUID
+            x-example: a24a6ea4-ce75-4665-a070-57453082c25
+        responses:
+            200:
+                description: All day off recorded for given person.
+        """
+        user_service.check_person_is_not_bot(person_id)
+        user_id = persons_service.get_current_user()["id"]
+        if person_id != user_id:
+            permissions.check_admin_permissions()
+        return time_spents_service.get_day_offs_between(
+            person_id=person_id,
         )
 
 
@@ -1184,7 +1202,7 @@ class RemoveFromDepartmentResource(Resource, ArgsMixin):
         """
         permissions.check_admin_permissions()
         try:
-            department = tasks_service.get_department(department_id)
+            tasks_service.get_department(department_id)
         except DepartmentNotFoundException:
             raise WrongParameterException(
                 "Department ID matches no department"
@@ -1232,11 +1250,16 @@ class ChangePasswordForPersonResource(Resource, ArgsMixin):
           400:
             description: Invalid password or inactive user
         """
+        user_service.check_person_is_not_bot(person_id)
         (password, password_2) = self.get_arguments()
-
+        permissions.check_admin_permissions()
         try:
-            permissions.check_admin_permissions()
             person = persons_service.get_person(person_id)
+            if (
+                person["email"] in config.PROTECTED_ACCOUNTS
+                and person["id"] != persons_service.get_current_user()["id"]
+            ):
+                raise PersonInProtectedAccounts()
             current_user = persons_service.get_current_user()
             auth.validate_password(password, password_2)
             password = auth.encrypt_password(password)
@@ -1247,7 +1270,7 @@ class ChangePasswordForPersonResource(Resource, ArgsMixin):
             )
             organisation = persons_service.get_organisation()
             time_string = format_datetime(
-                datetime.datetime.utcnow(),
+                date_helpers.get_utc_now_datetime(),
                 tzinfo=person["timezone"],
                 locale=person["locale"],
             )
@@ -1280,6 +1303,14 @@ Thank you and see you soon on Kitsu,
             return {"error": True, "message": "Password is too short."}, 400
         except UnactiveUserException:
             return {"error": True, "message": "User is unactive."}, 400
+        except PersonInProtectedAccounts:
+            return (
+                {
+                    "error": True,
+                    "message": "This user is in protected accounts.",
+                },
+                400,
+            )
 
     def get_arguments(self):
         args = self.get_args(
@@ -1329,8 +1360,9 @@ class DisableTwoFactorAuthenticationPersonResource(Resource, ArgsMixin):
           400:
             description: Inactive user
         """
+        user_service.check_person_is_not_bot(person_id)
+        permissions.check_admin_permissions()
         try:
-            permissions.check_admin_permissions()
             person = persons_service.get_person(person_id)
             current_user = persons_service.get_current_user()
             disable_two_factor_authentication_for_person(person["id"])
@@ -1340,7 +1372,7 @@ class DisableTwoFactorAuthenticationPersonResource(Resource, ArgsMixin):
             )
             organisation = persons_service.get_organisation()
             time_string = format_datetime(
-                datetime.datetime.utcnow(),
+                date_helpers.get_utc_now_datetime(),
                 tzinfo=person["timezone"],
                 locale=person["locale"],
             )
@@ -1368,3 +1400,21 @@ Thank you and see you soon on Kitsu,
                 "error": True,
                 "message": "Two factor authentication not enabled for this user.",
             }, 400
+
+
+class ClearAvatarPersonResource(Resource):
+    @jwt_required()
+    def delete(self, person_id):
+        """
+        Set `has_avatar` flag to False for current user and remove its avatar
+        file.
+        ---
+        tags:
+          - User
+        responses:
+            204:
+                description: Avatar file deleted
+        """
+        permissions.check_admin_permissions()
+        persons_service.clear_avatar(person_id)
+        return "", 204

@@ -2,6 +2,7 @@ from flask import Blueprint
 from zou.app.utils.api import configure_api_from_blueprint
 
 from zou.app.blueprints.tasks.resources import (
+    OpenTasksResource,
     TaskFullResource,
     TaskForEntityResource,
     DeleteTasksResource,
@@ -33,10 +34,14 @@ from zou.app.blueprints.tasks.resources import (
     AddTimeSpentResource,
     SetTaskMainPreviewResource,
     PersonsTasksDatesResource,
+    CreateConceptTasksResource,
+    OpenTasksStatsResource,
 )
 
 
 routes = [
+    ("/data/tasks/open-tasks", OpenTasksResource),
+    ("/data/tasks/open-tasks/stats", OpenTasksStatsResource),
     ("/data/tasks/<task_id>/comments", TaskCommentsResource),
     ("/data/tasks/<task_id>/comments/<comment_id>", TaskCommentResource),
     ("/data/tasks/<task_id>/previews", TaskPreviewsResource),
@@ -105,6 +110,10 @@ routes = [
     (
         "/actions/projects/<project_id>/task-types/<task_type_id>/edits/create-tasks",
         CreateEditTasksResource,
+    ),
+    (
+        "/actions/projects/<project_id>/task-types/<task_type_id>/concepts/create-tasks",
+        CreateConceptTasksResource,
     ),
     (
         "/actions/projects/<project_id>/task-types/<task_type_id>/create-tasks/<entity_type>/",

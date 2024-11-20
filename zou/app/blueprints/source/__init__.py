@@ -2,6 +2,7 @@
 This module is named source instead of import because import is a Python
 keyword.
 """
+
 from flask import Blueprint
 from zou.app.utils.api import configure_api_from_blueprint
 
@@ -79,9 +80,9 @@ from zou.app.blueprints.source.kitsu import (
     ImportKitsuTasksResource,
 )
 
-from zou.app.blueprints.source.edl import (
-    EDLImportResource,
-    EDLImportEpisodeResource,
+from zou.app.blueprints.source.otio import (
+    OTIOImportResource,
+    OTIOImportEpisodeResource,
 )
 
 routes = [
@@ -132,10 +133,10 @@ routes = [
         "/import/csv/projects/<project_id>/episodes/<episode_id>/task-types/<task_type_id>/estimations",
         TaskTypeEstimationsEpisodeCsvImportResource,
     ),
-    ("/import/edl/projects/<project_id>", EDLImportResource),
+    ("/import/otio/projects/<project_id>", OTIOImportResource),
     (
-        "/import/edl/projects/<project_id>/episodes/<episode_id>",
-        EDLImportEpisodeResource,
+        "/import/otio/projects/<project_id>/episodes/<episode_id>",
+        OTIOImportEpisodeResource,
     ),
     ("/import/kitsu/comments", ImportKitsuCommentsResource),
     ("/import/kitsu/entities", ImportKitsuEntitiesResource),

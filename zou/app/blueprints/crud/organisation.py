@@ -1,16 +1,14 @@
 from zou.app.models.organisation import Organisation
-from zou.app.utils import fields
 from zou.app.blueprints.crud.base import BaseModelResource, BaseModelsResource
+
+from zou.app.services import persons_service
 
 
 class OrganisationsResource(BaseModelsResource):
     def __init__(self):
         BaseModelsResource.__init__(self, Organisation)
 
-    def get(self):
-        return fields.serialize_list(Organisation.query.all())
-
-    def check_read_permissions(self):
+    def check_read_permissions(self, options=None):
         return True
 
 
@@ -25,3 +23,7 @@ class OrganisationResource(BaseModelResource):
         if "hours_by_day" in data:
             data["hours_by_day"] = float(data["hours_by_day"])
         return data
+
+    def post_update(self, instance_dict, data):
+        persons_service.clear_oranisation_cache()
+        return instance_dict

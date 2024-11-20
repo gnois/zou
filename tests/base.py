@@ -1,12 +1,13 @@
 import datetime
 import unittest
-import json
+import orjson as json
 import os
 import ntpath
+import fakeredis
 
 from mixer.backend.flask import mixer
 
-from zou.app import app
+from zou.app import app, db
 from zou.app.models.status_automation import StatusAutomation
 from zou.app.utils import fields, auth, fs
 from zou.app.services import (
@@ -32,6 +33,7 @@ from zou.app.models.output_type import OutputType
 from zou.app.models.organisation import Organisation
 from zou.app.models.person import Person
 from zou.app.models.playlist import Playlist
+from zou.app.models.preview_background_file import PreviewBackgroundFile
 from zou.app.models.preview_file import PreviewFile
 from zou.app.models.project import Project
 from zou.app.models.project_status import ProjectStatus
@@ -42,8 +44,18 @@ from zou.app.models.task_status import TaskStatus
 from zou.app.models.task_type import TaskType
 from zou.app.models.software import Software
 from zou.app.models.working_file import WorkingFile
+from zou.app.stores import auth_tokens_store
+
+from sqlalchemy.orm import scoped_session
+from sqlalchemy.orm import sessionmaker
+from flask import current_app
+
 
 TEST_FOLDER = os.path.join("tests", "tmp")
+
+auth_tokens_store.revoked_tokens_store = fakeredis.FakeStrictRedis(
+    decode_responses=True
+)
 
 
 class ApiTestCase(unittest.TestCase):
@@ -51,9 +63,17 @@ class ApiTestCase(unittest.TestCase):
     Set of helpers to make test development easier.
     """
 
+    @classmethod
+    def setUpClass(cls):
+        pass
+
+    @classmethod
+    def tearDownClass(cls):
+        pass
+
     def setUp(self):
         """
-        Configure Flask application before each test.
+        Configure application before each test.
         """
         app.test_request_context(headers={"mimetype": "application/json"})
         self.flask_app = app
@@ -61,9 +81,13 @@ class ApiTestCase(unittest.TestCase):
         self.base_headers = {}
         self.post_headers = {"Content-type": "application/json"}
         app.app_context().push()
+
         from zou.app.utils import cache
 
         cache.clear()
+
+    def tearDown(self):
+        pass
 
     def log_in(self, email):
         tokens = self.post(
@@ -197,7 +221,7 @@ class ApiTestCase(unittest.TestCase):
             data.update(extra_fields)
         response = self.app.post(path, data=data, headers=self.base_headers)
         self.assertEqual(response.status_code, code)
-        return response.data
+        return response.json
 
     def download_file(self, path, target_file_path, code=200):
         """
@@ -210,31 +234,68 @@ class ApiTestCase(unittest.TestCase):
         file_descriptor.write(response.data)
         return open(target_file_path, "rb").read()
 
-    def tearDown(self):
-        pass
-
 
 class ApiDBTestCase(ApiTestCase):
-    def setUp(self):
+    """
+    Set of helpers for Api tests.
+    """
+
+    @classmethod
+    def setUpClass(cls):
         """
-        Reset database before each test.
+        Configure application before all test methods.
+        Create all database tables only once for all tests in this class.
+        """
+        super(ApiDBTestCase, cls).setUpClass()
+        from zou.app.utils import dbhelpers
+
+        with app.app_context():
+            dbhelpers.drop_all()
+            dbhelpers.create_all()
+
+    @classmethod
+    def tearDownClass(cls):
+        """
+        Clean up resources after all test methods have run.
+        Delete database.
+        """
+        super(ApiDBTestCase, cls).tearDownClass()
+        from zou.app.utils import dbhelpers
+
+        with app.app_context():
+            dbhelpers.drop_all()
+
+    def setUp(self, expire_on_commit=True):
+        """
+        Configure application before each test.
+        set up database transaction.
         """
         super(ApiDBTestCase, self).setUp()
 
-        from zou.app.utils import dbhelpers
+        self._db_connection = db.engine.connect()
+        self._db_transaction = self._db_connection.begin()
+        factory = sessionmaker(
+            bind=self._db_connection,
+            binds={},
+            expire_on_commit=expire_on_commit,
+        )
+        self._db_session = scoped_session(
+            factory, current_app._get_current_object
+        )
+        db.session = self._db_session
 
-        dbhelpers.drop_all()
-        dbhelpers.create_all()
         self.generate_fixture_user()
         self.log_in_admin()
 
     def tearDown(self):
         """
-        Delete database after each test.
+        Configure application after each test.
+        Rollback transaction to return database to its original state.
         """
-        from zou.app.utils import dbhelpers
-
-        dbhelpers.drop_all()
+        super(ApiDBTestCase, self).tearDown()
+        self._db_transaction.rollback()
+        self._db_connection.close()
+        self._db_session.remove()
 
     def generate_data(self, cls, number, **kwargs):
         """
@@ -283,15 +344,22 @@ class ApiDBTestCase(ApiTestCase):
         )
 
     def generate_fixture_asset(
-        self, name="Tree", description="Description Tree", asset_type_id=None
+        self,
+        name="Tree",
+        description="Description Tree",
+        asset_type_id=None,
+        project_id=None,
     ):
         if asset_type_id is None:
             asset_type_id = self.asset_type.id
 
+        if project_id is None:
+            project_id = self.project_id
+
         self.asset = Entity.create(
             name=name,
             description=description,
-            project_id=self.project.id,
+            project_id=project_id,
             entity_type_id=asset_type_id,
         )
         return self.asset
@@ -357,14 +425,16 @@ class ApiDBTestCase(ApiTestCase):
         )
         return self.episode
 
-    def generate_fixture_shot(self, name="P01", nb_frames=0):
+    def generate_fixture_shot(self, name="P01", nb_frames=0, sequence_id=None):
+        if sequence_id is None:
+            sequence_id = self.sequence.id
         self.shot = Entity.create(
             name=name,
             description="Description Shot 01",
             data={"fps": 25, "frame_in": 0, "frame_out": 100},
             project_id=self.project.id,
             entity_type_id=self.shot_type.id,
-            parent_id=self.sequence.id,
+            parent_id=sequence_id,
             nb_frames=nb_frames,
         )
         return self.shot
@@ -648,7 +718,7 @@ class ApiDBTestCase(ApiTestCase):
         return self.assigner
 
     def generate_fixture_task(
-        self, name="Master", entity_id=None, task_type_id=None
+        self, name="Master", entity_id=None, task_type_id=None, project_id=None
     ):
         if entity_id is None:
             entity_id = self.asset.id
@@ -656,12 +726,15 @@ class ApiDBTestCase(ApiTestCase):
         if task_type_id is None:
             task_type_id = self.task_type.id
 
+        if project_id is None:
+            project_id = self.project.id
+
         start_date = fields.get_date_object("2017-02-20")
         due_date = fields.get_date_object("2017-02-28")
         real_start_date = fields.get_date_object("2017-02-22")
         self.task = Task.create(
             name=name,
-            project_id=self.project.id,
+            project_id=project_id,
             task_type_id=task_type_id,
             task_status_id=self.task_status.id,
             entity_id=entity_id,
@@ -700,16 +773,21 @@ class ApiDBTestCase(ApiTestCase):
         self.project.save()
         return self.task_standard
 
-    def generate_fixture_shot_task(self, name="Master", task_type_id=None):
+    def generate_fixture_shot_task(
+        self, name="Master", shot_id=None, task_type_id=None
+    ):
         if task_type_id is None:
             task_type_id = self.task_type_animation.id
+
+        if shot_id is None:
+            shot_id = self.shot.id
 
         self.shot_task = Task.create(
             name=name,
             project_id=self.project.id,
             task_type_id=task_type_id,
             task_status_id=self.task_status.id,
-            entity_id=self.shot.id,
+            entity_id=shot_id,
             assignees=[self.person],
             assigner_id=self.assigner.id,
         )
@@ -890,20 +968,35 @@ class ApiDBTestCase(ApiTestCase):
         )
 
     def generate_fixture_preview_file(
-        self, revision=1, name="main", position=1, status="ready"
+        self,
+        revision=1,
+        name="main",
+        position=1,
+        status="ready",
+        duration=10,
+        task_id=None,
     ):
+        task_id = task_id or self.task.id
         self.preview_file = PreviewFile.create(
             name=name,
             revision=revision,
             description="test description",
             source="pytest",
-            task_id=self.task.id,
+            task_id=task_id,
             extension="mp4",
             person_id=self.person.id,
             position=position,
             status=status,
+            duration=duration,
         )
         return self.preview_file
+
+    def generate_fixture_preview_background_file(
+        self,
+        name="test",
+    ):
+        self.preview_background_file = PreviewBackgroundFile.create(name=name)
+        return self.preview_background_file
 
     def get_fixture_file_path(self, relative_path):
         current_path = os.getcwd()
@@ -1001,10 +1094,12 @@ class ApiDBTestCase(ApiTestCase):
         )
         return self.schedule_item.serialize()
 
-    def generate_fixture_day_off(self, date, person_id=None):
+    def generate_fixture_day_off(self, date, end_date=None, person_id=None):
         if person_id is None:
             person_id = self.person.id
-        self.day_off = DayOff.create(date=date, person_id=person_id)
+        self.day_off = DayOff.create(
+            date=date, end_date=end_date or date, person_id=person_id
+        )
         return self.day_off.serialize()
 
     def generate_fixture_edit(self, name="Edit", parent_id=None):
@@ -1042,6 +1137,70 @@ class ApiDBTestCase(ApiTestCase):
         self.generate_fixture_sequence()
         self.generate_fixture_shot()
         self.generate_fixture_scene()
+
+    def generate_fixture_shot_tasks_and_previews(self, task_type_id):
+        episode_01 = self.episode
+        sequence_01 = self.sequence
+        shot_01 = self.shot
+        shot_02 = self.generate_fixture_shot("SH02")
+        shot_03 = self.generate_fixture_shot("SH03")
+
+        self.generate_fixture_episode("E02")
+        episode_02 = self.episode
+        self.generate_fixture_sequence("S02", episode_id=episode_02.id)
+        sequence_02 = self.sequence
+        shot_e201 = self.generate_fixture_shot(
+            "E2SH01", sequence_id=sequence_02.id
+        )
+
+        task_shot_01 = self.generate_fixture_shot_task(
+            shot_id=shot_01.id, task_type_id=task_type_id
+        )
+        task_shot_02 = self.generate_fixture_shot_task(
+            shot_id=shot_02.id, task_type_id=task_type_id
+        )
+        task_shot_03 = self.generate_fixture_shot_task(
+            shot_id=shot_03.id, task_type_id=task_type_id
+        )
+        task_shot_e201 = self.generate_fixture_shot_task(
+            shot_id=shot_e201.id, task_type_id=task_type_id
+        )
+        preview_01 = self.generate_fixture_preview_file(
+            task_id=task_shot_01.id, revision=1, duration=15
+        )
+        preview_01 = self.generate_fixture_preview_file(
+            task_id=task_shot_01.id, revision=2, duration=25
+        )
+        preview_01 = self.generate_fixture_preview_file(
+            task_id=task_shot_01.id, revision=3, duration=30
+        )
+        preview_02 = self.generate_fixture_preview_file(
+            task_id=task_shot_02.id, revision=1, duration=20
+        )
+        preview_03 = self.generate_fixture_preview_file(
+            task_id=task_shot_03.id, revision=1, duration=10
+        )
+        preview_e201 = self.generate_fixture_preview_file(
+            task_id=task_shot_e201.id, revision=1, duration=40
+        )
+        return (
+            episode_01,
+            episode_02,
+            sequence_01,
+            sequence_02,
+            shot_01,
+            shot_02,
+            shot_03,
+            shot_e201,
+            task_shot_01,
+            task_shot_02,
+            task_shot_03,
+            task_shot_e201,
+            preview_01,
+            preview_02,
+            preview_03,
+            preview_e201,
+        )
 
     def assign_task(self, task_id, user_id):
         return tasks_service.assign_task(task_id, user_id)

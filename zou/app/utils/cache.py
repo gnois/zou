@@ -3,6 +3,7 @@ This module is a wrapper for flask_caching. It configures it and rename
 the memoize function. The aim with that cache is to minimize the requests
 made on the target database.
 """
+
 import redis
 
 from flask_caching import Cache
@@ -16,6 +17,7 @@ try:
         host=config.KEY_VALUE_STORE["host"],
         port=config.KEY_VALUE_STORE["port"],
         db=config.MEMOIZE_DB_INDEX,
+        password=config.KEY_VALUE_STORE["password"],
         decode_responses=True,
     )
     redis_cache.get("test")
@@ -25,6 +27,7 @@ try:
             "CACHE_REDIS_HOST": config.KEY_VALUE_STORE["host"],
             "CACHE_REDIS_PORT": config.KEY_VALUE_STORE["port"],
             "CACHE_REDIS_DB": config.MEMOIZE_DB_INDEX,
+            "CACHE_REDIS_PASSWORD": config.KEY_VALUE_STORE["password"],
         }
     )
 

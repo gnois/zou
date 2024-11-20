@@ -1,23 +1,31 @@
 from zou.app.models.metadata_descriptor import (
     MetadataDescriptor,
-    METADATA_DESCRIPTOR_TYPES
+    METADATA_DESCRIPTOR_TYPES,
 )
 
-from zou.app.models.department import Department
-
 from zou.app.blueprints.crud.base import BaseModelResource, BaseModelsResource
-
-from sqlalchemy.exc import StatementError
+from zou.app.utils import permissions
+from zou.app.models.project import Project
+from zou.app.services import user_service
 
 from zou.app.services.exception import (
-    ArgumentsException,
-    DepartmentNotFoundException
+    WrongParameterException,
 )
 
 
 class MetadataDescriptorsResource(BaseModelsResource):
     def __init__(self):
         BaseModelsResource.__init__(self, MetadataDescriptor)
+
+    def check_read_permissions(self, options=None):
+        return not permissions.has_vendor_permissions()
+
+    def add_project_permission_filter(self, query):
+        if not permissions.has_admin_permissions():
+            query = query.join(Project).filter(
+                user_service.build_related_projects_filter()
+            )
+        return query
 
     def all_entries(self, query=None, relations=True):
         if query is None:
@@ -33,45 +41,25 @@ class MetadataDescriptorsResource(BaseModelsResource):
         Check if the data descriptor has a valid data_type.
         """
         if "data_type" in data:
-            types = [
-                type_name for type_name, label in METADATA_DESCRIPTOR_TYPES
-            ]
+            types = [type_name for type_name, _ in METADATA_DESCRIPTOR_TYPES]
             if data["data_type"] not in types:
-                raise ArgumentsException("Invalid data_type")
+                raise WrongParameterException("Invalid data_type")
         return True
 
 
 class MetadataDescriptorResource(BaseModelResource):
+
     def __init__(self):
         BaseModelResource.__init__(self, MetadataDescriptor)
-
-    def post_update(self, instance_dict):
-        instance_dict["departments"] = [
-            str(department.id) for department in self.instance.departments
-        ]
-        return instance_dict
 
     def update_data(self, data, instance_id):
         """
         Check if the data descriptor has a valid data_type and valid
         departments.
         """
-
+        data = super().update_data(data, instance_id)
         if "data_type" in data:
-            types = [
-                type_name for type_name, label in METADATA_DESCRIPTOR_TYPES
-            ]
+            types = [type_name for type_name, _ in METADATA_DESCRIPTOR_TYPES]
             if data["data_type"] not in types:
-                raise ArgumentsException("Invalid data_type")
-
-        if "departments" in data:
-            try:
-                departments = []
-                for department_id in data["departments"]:
-                    department = Department.get(department_id)
-                    if department is not None:
-                        departments.append(department)
-            except StatementError:
-                raise DepartmentNotFoundException()
-            data["departments"] = departments
+                raise WrongParameterException("Invalid data_type")
         return data

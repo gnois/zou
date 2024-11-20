@@ -1,7 +1,8 @@
 import datetime
 
+
 from flask import abort, request
-from flask_restful import Resource
+from flask_restful import Resource, inputs
 from flask_jwt_extended import jwt_required
 
 from zou.app.services.exception import (
@@ -9,6 +10,7 @@ from zou.app.services.exception import (
     PersonNotFoundException,
     MalformedFileTreeException,
     WrongDateFormatException,
+    WrongParameterException,
 )
 from zou.app.services import (
     assets_service,
@@ -24,25 +26,24 @@ from zou.app.services import (
     shots_service,
     tasks_service,
     user_service,
+    concepts_service,
 )
-from zou.app.utils import events, query, permissions
+from zou.app.utils import events, query, permissions, date_helpers
 from zou.app.mixin import ArgsMixin
 
 
 class AddPreviewResource(Resource, ArgsMixin):
-    """
-    Add a preview to given task. Revision is automatically set: it is
-    equal to last revision + 1, or can be set manually.
-    """
-
     @jwt_required()
     def post(self, task_id, comment_id):
         """
-        Add a preview to given task.
+        Add preview metadata to given task. The preview file itself should be
+        uploaded afterward.
+
+        Revision is automatically set: it is equal to last revision + 1. It can
+        be also set manually.
         ---
         tags:
         - Tasks
-        description: "Revision is automatically set: it is equal to last revision + 1, or can be set manually."
         parameters:
           - in: path
             name: task_id
@@ -57,20 +58,14 @@ class AddPreviewResource(Resource, ArgsMixin):
             format: UUID
             x-example: a24a6ea4-ce75-4665-a070-57453082c25
           - in: body
-            name: revision
-            required: False
             schema:
                 type: object
                 properties:
-                    duration:
+                    revision:
                         type: integer
-          - in: formData
-            name: file
-            type: file
-            required: True
         responses:
             201:
-                description: Preview added to given task
+                description: Preview metadata added to given task
         """
         args = self.get_args([("revision", 0, False, int)])
 
@@ -78,6 +73,7 @@ class AddPreviewResource(Resource, ArgsMixin):
         user_service.check_project_access(task["project_id"])
         user_service.check_entity_access(task["entity_id"])
 
+        tasks_service.clear_comment_cache(comment_id)
         comment = tasks_service.get_comment(comment_id)
         tasks_service.get_task_status(comment["task_status_id"])
         person = persons_service.get_current_user()
@@ -354,6 +350,7 @@ class PersonTasksResource(Resource):
             200:
                 description: Tasks assigned to user that are not done
         """
+        user_service.check_person_is_not_bot(person_id)
         if not permissions.has_admin_permissions():
             projects = user_service.related_projects()
         else:
@@ -397,6 +394,7 @@ class PersonRelatedTasksResource(Resource):
             200:
                 description: All Tasks for given task type
         """
+        user_service.check_person_is_not_bot(person_id)
         user = persons_service.get_current_user()
         if person_id != user["id"]:
             permissions.check_admin_permissions()
@@ -428,6 +426,7 @@ class PersonDoneTasksResource(Resource):
             200:
                 description: Tasks assigned to user that are done
         """
+        user_service.check_person_is_not_bot(person_id)
         if not permissions.has_admin_permissions():
             projects = user_service.related_projects()
         else:
@@ -487,6 +486,63 @@ class CreateShotTasksResource(Resource):
 
         task_type = tasks_service.get_task_type(task_type_id)
         tasks = tasks_service.create_tasks(task_type, shots)
+        return tasks, 201
+
+
+class CreateConceptTasksResource(Resource):
+    """
+    Create a new task for given concept and task type.
+    """
+
+    @jwt_required()
+    def post(self, project_id, task_type_id):
+        """
+        Create a new task for given concept and task type.
+        ---
+        tags:
+        - Tasks
+        parameters:
+          - in: path
+            name: project_id
+            required: True
+            type: string
+            format: UUID
+            x-example: a24a6ea4-ce75-4665-a070-57453082c25
+          - in: path
+            name: task_type_id
+            required: True
+            type: string
+            format: UUID
+            x-example: a24a6ea4-ce75-4665-a070-57453082c25
+        responses:
+            201:
+                description: New task for given concept and task type created
+        """
+        user_service.check_project_access(project_id)
+        if (
+            permissions.has_vendor_permissions()
+            or permissions.has_client_permissions()
+        ):
+            raise permissions.PermissionDenied
+        task_type = tasks_service.get_task_type(task_type_id)
+
+        concept_ids = request.json
+        concepts = []
+        if isinstance(concept_ids, list) and len(concept_ids) > 0:
+            for concept_id in concept_ids:
+                concept = concepts_service.get_concept(concept_id)
+                if concept["project_id"] == project_id:
+                    concepts.append(concept)
+        else:
+            criterions = query.get_query_criterions_from_request(request)
+            criterions["project_id"] = project_id
+            concepts = concepts_service.get_concepts(criterions)
+
+        for concept in concepts:
+            user_service.check_entity_access(concept["id"])
+
+        task_type = tasks_service.get_task_type(task_type_id)
+        tasks = tasks_service.create_tasks(task_type, concepts)
         return tasks, 201
 
 
@@ -737,7 +793,11 @@ class ToReviewResource(Resource, ArgsMixin):
                 ("comment", ""),
                 ("name", "main"),
                 {"name": "revision", "default": 1, "type": int},
-                {"name": "change_status", "default": True, "type": bool},
+                {
+                    "name": "change_status",
+                    "default": True,
+                    "type": inputs.boolean,
+                },
             ]
         )
 
@@ -788,7 +848,7 @@ class ClearAssignationResource(Resource, ArgsMixin):
         tasks = []
         for task_id in task_ids:
             try:
-                user_service.check_task_departement_access_for_unassign(
+                user_service.check_task_department_access_for_unassign(
                     task_id, person_id
                 )
                 tasks_service.clear_assignation(task_id, person_id=person_id)
@@ -868,10 +928,13 @@ class TasksAssignResource(Resource, ArgsMixin):
         current_user = persons_service.get_current_user()
         for task_id in args["task_ids"]:
             try:
-                user_service.check_task_departement_access(task_id, person_id)
-                task = self.assign_task(task_id, person_id, current_user["id"])
-                notifications_service.create_assignation_notification(
+                user_service.check_person_is_not_bot(person_id)
+                user_service.check_task_department_access(task_id, person_id)
+                task = tasks_service.assign_task(
                     task_id, person_id, current_user["id"]
+                )
+                notifications_service.create_assignation_notification(
+                    task_id, person_id
                 )
                 tasks.append(task)
             except TaskNotFoundException:
@@ -884,9 +947,6 @@ class TasksAssignResource(Resource, ArgsMixin):
             projects_service.add_team_member(tasks[0]["project_id"], person_id)
 
         return tasks
-
-    def assign_task(self, task_id, person_id, assigner_id):
-        return tasks_service.assign_task(task_id, person_id, assigner_id)
 
 
 class TaskAssignResource(Resource, ArgsMixin):
@@ -936,12 +996,13 @@ class TaskAssignResource(Resource, ArgsMixin):
             ]
         )
         person_id = args["person_id"]
-
+        current_user = persons_service.get_current_user()
         try:
-            task = tasks_service.get_task(task_id)
-            user_service.check_task_departement_access(task_id, person_id)
-
-            self.assign_task(task_id, person_id)
+            user_service.check_person_is_not_bot(person_id)
+            user_service.check_task_department_access(task_id, person_id)
+            task = tasks_service.assign_task(
+                task_id, person_id, current_user["id"]
+            )
             notifications_service.create_assignation_notification(
                 task_id, person_id
             )
@@ -950,9 +1011,6 @@ class TaskAssignResource(Resource, ArgsMixin):
             return {"error": "Assignee doesn't exist in database."}, 400
 
         return task
-
-    def assign_task(self, task_id, person_id):
-        return tasks_service.assign_task(task_id, person_id)
 
 
 class TaskFullResource(Resource):
@@ -1069,18 +1127,63 @@ class SetTimeSpentResource(Resource, ArgsMixin):
             404:
                 description: Wrong date format
         """
-        args = self.get_args([("duration", 0, False, int)])
-
+        user_service.check_person_is_not_bot(person_id)
+        args = self.get_args([("duration", 0, True, int)])
         try:
-            task = tasks_service.get_task(task_id)
-            user_service.check_project_access(task["project_id"])
-            user_service.check_entity_access(task["entity_id"])
-            persons_service.get_person(person_id)
+            if args["duration"] <= 0:
+                raise WrongParameterException("Duration must be positive")
+            user_service.check_time_spent_access(task_id, person_id)
             time_spent = tasks_service.create_or_update_time_spent(
                 task_id,
                 person_id,
-                datetime.datetime.strptime(date, "%Y-%m-%d"),
+                date_helpers.get_date_from_string(date),
                 args["duration"],
+            )
+            return time_spent, 201
+        except ValueError:
+            abort(404)
+        except WrongDateFormatException:
+            abort(404)
+
+    @jwt_required()
+    def delete(self, task_id, date, person_id):
+        """
+        Delete time spent by a person on a task for a given day.
+        ---
+        tags:
+        - Tasks
+        parameters:
+          - in: path
+            name: task_id
+            required: True
+            type: string
+            format: UUID
+            x-example: a24a6ea4-ce75-4665-a070-57453082c25
+          - in: path
+            name: date
+            required: True
+            type: string
+            format: date
+            x-example: "2022-07-12"
+          - in: path
+            name: person_id
+            required: True
+            type: string
+            format: UUID
+            x-example: a24a6ea4-ce75-4665-a070-57453082c25
+        responses:
+            201:
+                description: Time spent by given person on given task for given day is removed
+            404:
+                description: Wrong date format
+        """
+        user_service.check_person_is_not_bot(person_id)
+        try:
+            user_service.check_time_spent_access(task_id, person_id)
+            time_spent = tasks_service.delete_time_spent(
+                task_id,
+                person_id,
+                datetime.datetime.strptime(date, "%Y-%m-%d"),
             )
             return time_spent, 201
         except ValueError:
@@ -1133,14 +1236,12 @@ class AddTimeSpentResource(Resource, ArgsMixin):
             404:
                 description: Wrong date format
         """
-        args = self.get_args([("duration", 0, False, int)])
-
+        user_service.check_person_is_not_bot(person_id)
+        args = self.get_args([("duration", 0, True, int)])
         try:
-            task = tasks_service.get_task(task_id)
-            user_service.check_project_access(task["project_id"])
-            user_service.check_entity_access(task["entity_id"])
-
-            persons_service.get_person(person_id)
+            if args["duration"] <= 0:
+                raise WrongParameterException("Duration must be positive")
+            user_service.check_time_spent_access(task_id, person_id)
             time_spent = tasks_service.create_or_update_time_spent(
                 task_id, person_id, date, args["duration"], add=True
             )
@@ -1366,7 +1467,6 @@ class ProjectTasksResource(Resource, ArgsMixin):
     """
 
     @jwt_required()
-    @permissions.require_admin
     def get(self, project_id):
         """
         Retrieve all tasks related to given project.
@@ -1381,13 +1481,34 @@ class ProjectTasksResource(Resource, ArgsMixin):
             type: string
             format: UUID
             x-example: a24a6ea4-ce75-4665-a070-57453082c25
+          - in: query
+            name: page
+            required: False
+            type: integer
+            x-example: 1
+          - in: query
+            name: task_type_id
+            required: False
+            type: string
+            format: UUID
+            x-example: a24a6ea4-ce75-4665-a070-57453082c25
+          - in: query
+            name: episode_id
+            required: False
+            type: string
+            format: UUID
+            x-example: a24a6ea4-ce75-4665-a070-57453082c25
         responses:
             200:
                 description: All tasks related to given project
         """
         projects_service.get_project(project_id)
         page = self.get_page()
-        return tasks_service.get_tasks_for_project(project_id, page)
+        task_type_id = self.get_task_type_id()
+        episode_id = self.get_episode_id()
+        return tasks_service.get_tasks_for_project(
+            project_id, page, task_type_id=task_type_id, episode_id=episode_id
+        )
 
 
 class ProjectCommentsResource(Resource, ArgsMixin):
@@ -1397,7 +1518,6 @@ class ProjectCommentsResource(Resource, ArgsMixin):
     """
 
     @jwt_required()
-    @permissions.require_admin
     def get(self, project_id):
         """
         Retrieve all comments to tasks related to given project.
@@ -1417,6 +1537,12 @@ class ProjectCommentsResource(Resource, ArgsMixin):
                 description: All comments to tasks related to given project
         """
         projects_service.get_project(project_id)
+        user_service.check_project_access(project_id)
+        if (
+            permissions.has_vendor_permissions()
+            or permissions.has_client_permissions()
+        ):
+            raise permissions.PermissionDenied
         page = self.get_page()
         return tasks_service.get_comments_for_project(project_id, page)
 
@@ -1513,3 +1639,149 @@ class PersonsTasksDatesResource(Resource):
         """
         permissions.check_admin_permissions()
         return tasks_service.get_persons_tasks_dates()
+
+
+class OpenTasksResource(Resource, ArgsMixin):
+    """
+    Return all tasks related to open projects.
+    """
+
+    @jwt_required()
+    def get(self):
+        """
+        Return all tasks related to open projects.
+        ---
+        tags:
+        - Tasks
+        parameters:
+          - in: query
+            name: project_id
+            description: Filter tasks on given project ID
+            type: string
+            format: UUID
+            x-example: a24a6ea4-ce75-4665-a070-57453082c25
+          - in: query
+            name: task_status_id
+            description: Filter tasks on given task status ID
+            type: string
+            format: UUID
+            x-example: a24a6ea4-ce75-4665-a070-57453082c25
+          - in: query
+            name: task_type_id
+            description: Filter tasks on given task type ID ID
+            type: string
+            format: UUID
+            x-example: a24a6ea4-ce75-4665-a070-57453082c25
+          - in: query
+            name: person_id
+            description: Filter tasks on given person ID
+            type: string
+            format: UUID
+            x-example: a24a6ea4-ce75-4665-a070-57453082c25
+          - in: query
+            name: start_date
+            description: Filter tasks posterior to given start date
+            type: string
+            format: date
+            x-example: "2022-07-12"
+          - in: query
+            name: due_date
+            description: Filter tasks anterior to given due date
+            type: string
+            format: date
+            x-example: "2022-07-12"
+          - in: query
+            name: priority
+            description: Filter tasks on given priority
+            type: integer
+            x-example: "3"
+          - in: query
+            name: page
+            description: Page number
+            type: integer
+            x-example: 1
+            default: 1
+          - in: query
+            name: limit
+            description: Number of tasks per page
+            type: integer
+            x-example: 100
+            default: 100
+
+        responses:
+            200:
+                schema:
+                    type: object
+                    properties:
+                        data:
+                            type: array
+                            description: List of tasks
+                        stats:
+                            type: object
+                            properties:
+                                total:
+                                    type: integer
+                                    description: Total number of tasks
+                                total_duration:
+                                    type: integer
+                                    description: Total duration of tasks in minutes
+                                total_estimation:
+                                    type: integer
+                                    description: Total estimation of tasks in minutes
+                                status:
+                                    type: object
+                                    description: Number of tasks per status
+                        limit:
+                            type: integer
+                            description: Number of tasks per page
+                        page:
+                            type: integer
+                            description: Page number
+                        is_more:
+                            type: boolean
+                            description: True if there are more tasks to retrieve
+        """
+        args = self.get_args(
+            [
+                ("task_type_id", None, False, str),
+                ("project_id", None, False, str),
+                ("person_id", None, False, str),
+                ("task_status_id", None, False, str),
+                ("start_date", None, False, str),
+                ("due_date", None, False, str),
+                ("priority", None, False, str),
+                ("group_by", None, False, str),
+                ("page", None, False, int),
+                ("limit", 100, False, int),
+            ]
+        )
+        return tasks_service.get_open_tasks(
+            task_type_id=args["task_type_id"],
+            project_id=args["project_id"],
+            person_id=args["person_id"],
+            task_status_id=args["task_status_id"],
+            start_date=args["start_date"],
+            due_date=args["due_date"],
+            priority=args["priority"],
+            page=args["page"],
+            limit=args["limit"],
+        )
+
+
+class OpenTasksStatsResource(Resource, ArgsMixin):
+
+    @jwt_required()
+    def get(self):
+        """
+        Return task amount, task done amount, total estimation, total duration
+        by status by task type by project for open projects. It aggregates the
+        result at the project level.
+        ---
+        tags:
+        - Tasks
+        responses:
+            200:
+                description: A dict organized by project that contains
+                            the results for each task type and status pairs.
+        """
+        return tasks_service.get_open_tasks_stats()

@@ -1,9 +1,8 @@
-import datetime
-
 from sqlalchemy_utils import UUIDType
 from sqlalchemy import func
+from sqlalchemy import orm
 from zou.app import db
-from zou.app.utils import fields
+from zou.app.utils import fields, date_helpers
 
 
 class BaseMixin(object):
@@ -12,11 +11,13 @@ class BaseMixin(object):
     )
 
     # Audit fields
-    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    created_at = db.Column(
+        db.DateTime, default=date_helpers.get_utc_now_datetime
+    )
     updated_at = db.Column(
         db.DateTime,
-        default=datetime.datetime.utcnow,
-        onupdate=datetime.datetime.utcnow,
+        default=date_helpers.get_utc_now_datetime,
+        onupdate=date_helpers.get_utc_now_datetime,
     )
 
     def __repr__(self):
@@ -40,12 +41,12 @@ class BaseMixin(object):
         return db.session.get(cls, id)
 
     @classmethod
-    def get_by(cls, **kw):
+    def get_by(cls, *criterions, **kw):
         """
         Shorthand to retrieve data by using filters. It returns the first
         element of the returned data.
         """
-        return cls.query.filter_by(**kw).first()
+        return cls.query.filter(*criterions).filter_by(**kw).first()
 
     @classmethod
     def get_by_case_insensitive(cls, **kw):
@@ -82,9 +83,9 @@ class BaseMixin(object):
         """
         Shorthand to create an entry via the database session.
         """
-        instance = cls(**kw)
+
         try:
-            db.session.add(instance)
+            instance = cls.create_no_commit(**kw)
             db.session.commit()
         except BaseException:
             db.session.rollback()
@@ -98,16 +99,38 @@ class BaseMixin(object):
         Shorthand to create an entry via the database session without commiting
         the request.
         """
+        for key, value in kw.items():
+            if hasattr(cls, key):
+                field_key = getattr(cls, key)
+
+                if hasattr(field_key, "property"):
+                    if isinstance(
+                        field_key.property,
+                        orm.properties.RelationshipProperty,
+                    ):
+                        class_ = field_key.property.entity.class_
+                        values = []
+                        if value is not None:
+                            for id in value:
+                                if isinstance(id, str):
+                                    v = class_.get(id)
+                                elif isinstance(id, dict):
+                                    v = class_.get(id["id"])
+                                else:
+                                    v = id
+                                if v is not None:
+                                    values.append(v)
+                        kw[key] = values
         instance = cls(**kw)
         db.session.add(instance)
         return instance
 
     @classmethod
-    def delete_all_by(cls, **kw):
+    def delete_all_by(cls, *criterions, **kw):
         """
         Shorthand to delete data by using filters.
         """
-        result = cls.query.filter_by(**kw).delete()
+        result = cls.query.filter(*criterions).filter_by(**kw).delete()
         db.session.commit()
         return result
 
@@ -161,7 +184,12 @@ class BaseMixin(object):
 
     @classmethod
     def commit(cls):
-        db.session.commit()
+        try:
+            db.session.commit()
+        except BaseException:
+            db.session.rollback()
+            db.session.remove()
+            raise
 
     def save(self):
         """
@@ -169,7 +197,7 @@ class BaseMixin(object):
         instance fields.
         """
         try:
-            self.updated_at = datetime.datetime.utcnow()
+            self.updated_at = date_helpers.get_utc_now_datetime()
             db.session.add(self)
             db.session.commit()
         except BaseException:
@@ -183,7 +211,7 @@ class BaseMixin(object):
         instance id.
         """
         try:
-            db.session.delete(self)
+            self.delete_no_commit()
             db.session.commit()
         except BaseException:
             db.session.rollback()
@@ -204,10 +232,7 @@ class BaseMixin(object):
         instance fields.
         """
         try:
-            self.updated_at = datetime.datetime.utcnow()
-            for key, value in data.items():
-                setattr(self, key, value)
-            db.session.add(self)
+            self.update_no_commit(data)
             db.session.commit()
         except BaseException:
             db.session.rollback()
@@ -219,9 +244,31 @@ class BaseMixin(object):
         Shorthand to update an entry via the database session based on current
         instance fields. It doesn't generate a commit.
         """
-        self.updated_at = datetime.datetime.utcnow()
+        self.updated_at = date_helpers.get_utc_now_datetime()
         for key, value in data.items():
-            setattr(self, key, value)
+            if hasattr(self.__class__, key):
+                field_key = getattr(self.__class__, key)
+
+                if hasattr(field_key, "property"):
+                    if isinstance(
+                        field_key.property,
+                        orm.properties.RelationshipProperty,
+                    ):
+                        class_ = field_key.property.entity.class_
+                        values = []
+                        if value is not None:
+                            for id in value:
+                                if isinstance(id, str):
+                                    v = class_.get(id)
+                                elif isinstance(id, dict):
+                                    v = class_.get(id["id"])
+                                else:
+                                    v = id
+                                if v is not None:
+                                    values.append(v)
+                        setattr(self, key, values)
+                    else:
+                        setattr(self, key, value)
         db.session.add(self)
 
     def set_links(self, ids, LinkTable, field_left, field_right):

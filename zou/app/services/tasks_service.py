@@ -1,9 +1,9 @@
 import collections
-import datetime
 import uuid
 
 from sqlalchemy.exc import StatementError, IntegrityError, DataError
 from sqlalchemy.sql import func
+from sqlalchemy.sql.expression import case
 from sqlalchemy.orm import aliased
 
 from zou.app import app, db
@@ -18,31 +18,44 @@ from zou.app.models.comment import (
     preview_link_table,
 )
 from zou.app.models.department import Department
-from zou.app.models.entity import Entity
+from zou.app.models.entity import Entity, EntityLink
 from zou.app.models.entity_type import EntityType
 from zou.app.models.news import News
 from zou.app.models.person import Person
 from zou.app.models.preview_file import PreviewFile
 from zou.app.models.project import Project
+from zou.app.models.project_status import ProjectStatus
 from zou.app.models.task import Task
 from zou.app.models.task_type import TaskType
 from zou.app.models.task_status import TaskStatus
 from zou.app.models.time_spent import TimeSpent
+from zou.app.models.studio import Studio
 
-from zou.app.utils import cache, fields, query as query_utils
+from zou.app.utils import (
+    cache,
+    fields,
+    query as query_utils,
+    permissions,
+    date_helpers,
+)
+
 
 from zou.app.services.exception import (
     CommentNotFoundException,
+    EpisodeNotFoundException,
     PersonNotFoundException,
     TaskNotFoundException,
     TaskStatusNotFoundException,
     TaskTypeNotFoundException,
     DepartmentNotFoundException,
+    StudioNotFoundException,
     WrongDateFormatException,
+    TimeSpentNotFoundException,
 )
 
 from zou.app.services import (
     assets_service,
+    edits_service,
     base_service,
     files_service,
     notifications_service,
@@ -51,6 +64,8 @@ from zou.app.services import (
     shots_service,
     entities_service,
     edits_service,
+    concepts_service,
+    user_service,
 )
 
 
@@ -68,8 +83,14 @@ def clear_department_cache(department_id):
     cache.cache.delete_memoized(get_departments)
 
 
+def clear_studio_cache(studio_id):
+    cache.cache.delete_memoized(get_studio, studio_id)
+    cache.cache.delete_memoized(get_studios)
+
+
 def clear_task_cache(task_id):
     cache.cache.delete_memoized(get_task, task_id)
+    cache.cache.delete_memoized(get_task, task_id, True)
     cache.cache.delete_memoized(get_task_with_relations, task_id)
 
 
@@ -82,6 +103,11 @@ def clear_comment_cache(comment_id):
 @cache.memoize_function(120)
 def get_departments():
     return fields.serialize_models(Department.get_all())
+
+
+@cache.memoize_function(120)
+def get_studios():
+    return fields.serialize_models(Studio.get_all())
 
 
 @cache.memoize_function(120)
@@ -100,8 +126,17 @@ def get_to_review_status():
 
 
 @cache.memoize_function(120)
-def get_default_status():
-    return get_or_create_status("Todo", "todo", "#f5f5f5", is_default=True)
+def get_default_status(for_concept=False):
+    if for_concept:
+        return get_or_create_status(
+            "Neutral",
+            "neutral",
+            "#CCCCCC",
+            is_default=True,
+            for_concept=True,
+        )
+    else:
+        return get_or_create_status("Todo", "todo", "#f5f5f5", is_default=True)
 
 
 def get_task_status_raw(task_status_id):
@@ -135,6 +170,22 @@ def get_department(department_id):
         raise DepartmentNotFoundException
 
     return department.serialize()
+
+
+@cache.memoize_function(120)
+def get_studio(studio_id):
+    """
+    Get studio matching given id as a dictionary.
+    """
+    try:
+        studio = Studio.get(studio_id)
+    except StatementError:
+        raise StudioNotFoundException
+
+    if studio is None:
+        raise StudioNotFoundException
+
+    return studio.serialize()
 
 
 def get_department_from_task_type(task_type_id):
@@ -265,6 +316,14 @@ def get_tasks_for_edit(edit_id, relations=False):
     return get_task_dicts_for_entity(edit["id"], relations=relations)
 
 
+def get_tasks_for_concept(concept_id, relations=False):
+    """
+    Get all tasks for given concept.
+    """
+    concept = shots_service.get_shot(concept_id)
+    return get_task_dicts_for_entity(concept["id"], relations=relations)
+
+
 def get_shot_tasks_for_sequence(sequence_id, relations=False):
     """
     Get all shot tasks for given sequence.
@@ -376,8 +435,6 @@ def get_task_types_for_sequence(sequence_id):
     )
     return fields.serialize_models(task_types)
 
-    return get_task_types_for_entity(sequence_id)
-
 
 def get_task_types_for_asset(asset_id):
     """
@@ -402,6 +459,13 @@ def get_task_types_for_episode(episode_id):
         .all()
     )
     return fields.serialize_models(task_types)
+
+
+def get_task_types_for_concept(concept_id):
+    """
+    Return all task types for which there is a task related to given concept.
+    """
+    return get_task_types_for_entity(concept_id)
 
 
 def get_task_types_for_entity(entity_id):
@@ -661,6 +725,9 @@ def _build_preview_map_for_comments(comment_ids, is_client=False):
                     "task_id": str(preview.task_id),
                     "revision": preview.revision,
                     "extension": preview.extension,
+                    "width": preview.width,
+                    "height": preview.height,
+                    "duration": preview.duration,
                     "status": status,
                     "validation_status": validation_status,
                     "original_name": preview.original_name,
@@ -831,10 +898,10 @@ def get_person_tasks(person_id, projects, is_done=None):
             Entity.description,
             Entity.data,
             Entity.preview_file_id,
-            Entity.source_id,
             EntityType.name,
             Entity.canceled,
             Entity.parent_id,
+            Entity.source_id,
             Sequence.name,
             Episode.id,
             Episode.name,
@@ -854,6 +921,31 @@ def get_person_tasks(person_id, projects, is_done=None):
     else:
         query = query.filter(TaskStatus.is_done == False)
 
+    # Add episodes linked to assets
+    asset_ids = []
+    for task in query.all():
+        asset_ids.append(str(task[0].entity_id))
+
+    cast_in_episode_ids = {}
+    cast_in_episode_names = {}
+    episode_links_query = (
+        EntityLink.query.join(Episode, EntityLink.entity_in_id == Episode.id)
+        .join(EntityType, EntityType.id == Episode.entity_type_id)
+        .filter(EntityType.name == "Episode")
+        .filter(EntityLink.entity_out_id.in_(asset_ids))
+        .add_columns(Episode.id, Episode.name)
+        .order_by(Episode.name)
+    )
+    for link, episode_id, episode_name in episode_links_query.all():
+        asset_id = str(link.entity_out_id)
+        if asset_id not in cast_in_episode_ids:
+            cast_in_episode_ids[asset_id] = []
+            cast_in_episode_names[asset_id] = []
+        cast_in_episode_ids[asset_id].append(episode_id)
+        cast_in_episode_names[asset_id].append(episode_name)
+
+    # Build the result
+
     tasks = []
     for (
         task,
@@ -864,10 +956,10 @@ def get_person_tasks(person_id, projects, is_done=None):
         entity_description,
         entity_data,
         entity_preview_file_id,
-        entity_source_id,
         entity_type_name,
         entity_canceled,
         entity_parent_id,
+        entity_source_id,
         sequence_name,
         episode_id,
         episode_name,
@@ -886,6 +978,12 @@ def get_person_tasks(person_id, projects, is_done=None):
 
         if episode_id is None:
             episode_id = entity_source_id
+            if episode_id is not None and episode_id != "":
+                try:
+                    episode = shots_service.get_episode(episode_id)
+                    episode_name = episode["name"]
+                except EpisodeNotFoundException:
+                    episode_name = "MP"
 
         task_dict = get_task_with_relations(str(task.id))
         if entity_type_name == "Sequence" and entity_parent_id is not None:
@@ -921,6 +1019,12 @@ def get_person_tasks(person_id, projects, is_done=None):
                 "task_status_short_name": task_status_short_name,
             }
         )
+
+        if str(task.entity_id) in cast_in_episode_ids:
+            task_dict["episode_ids"] = cast_in_episode_ids[str(task.entity_id)]
+            task_dict["episode_names"] = cast_in_episode_names[
+                str(task.entity_id)
+            ]
         tasks.append(task_dict)
 
     task_ids = [task["id"] for task in tasks]
@@ -933,7 +1037,7 @@ def get_person_tasks(person_id, projects, is_done=None):
     return tasks
 
 
-def get_person_tasks_to_check(department_ids, project_ids):
+def get_person_tasks_to_check(project_ids=None, department_ids=None):
     """
     Retrieve all tasks requiring a feedback for given departments and projects.
     """
@@ -941,15 +1045,14 @@ def get_person_tasks_to_check(department_ids, project_ids):
     Episode = aliased(Entity, name="episode")
     query = (
         Task.query.join(Project, Project.id == Task.project_id)
+        .join(ProjectStatus, ProjectStatus.id == Project.project_status_id)
         .join(TaskType, TaskType.id == Task.task_type_id)
         .join(TaskStatus, TaskStatus.id == Task.task_status_id)
         .join(Entity, Entity.id == Task.entity_id)
         .join(EntityType, EntityType.id == Entity.entity_type_id)
         .outerjoin(Sequence, Sequence.id == Entity.parent_id)
         .outerjoin(Episode, Episode.id == Sequence.parent_id)
-        .filter(Project.id.in_(project_ids))
         .filter(TaskStatus.is_feedback_request)
-        .filter(TaskType.department_id.in_(department_ids))
         .add_columns(
             Project.name,
             Project.has_avatar,
@@ -973,6 +1076,14 @@ def get_person_tasks_to_check(department_ids, project_ids):
             TaskStatus.short_name,
         )
     )
+
+    if project_ids is not None:
+        query = query.filter(Project.id.in_(project_ids))
+    else:
+        query = query.filter(user_service.build_open_project_filter())
+
+    if department_ids:
+        query = query.filter(TaskType.department_id.in_(department_ids))
     tasks = []
     for (
         task,
@@ -1077,7 +1188,6 @@ def create_tasks(task_type, entities):
     """
     Create a new task for given task type and for each entity.
     """
-    task_status = get_default_status()
     current_user_id = None
     try:
         current_user_id = persons_service.get_current_user()["id"]
@@ -1090,6 +1200,10 @@ def create_tasks(task_type, entities):
             entity_id=entity["id"], task_type_id=task_type["id"]
         ).scalar()
         if existing_task is None:
+            task_status = get_default_status(
+                for_concept=entity["entity_type_id"]
+                == concepts_service.get_concept_type()["id"]
+            )
             task = Task.create_no_commit(
                 name="main",
                 duration=0,
@@ -1121,7 +1235,10 @@ def create_task(task_type, entity, name="main"):
     """
     Create a new task for given task type and entity.
     """
-    task_status = get_default_status()
+    task_status = get_default_status(
+        for_concept=entity["entity_type_id"]
+        == concepts_service.get_concept_type()["id"]
+    )
     try:
         try:
             current_user_id = persons_service.get_current_user()["id"]
@@ -1178,7 +1295,10 @@ def update_task(task_id, data):
     task = get_task_raw(task_id)
 
     if is_finished(task, data):
-        data["end_date"] = datetime.datetime.utcnow()
+        data["end_date"] = date_helpers.get_utc_now_datetime()
+
+    if is_done(task, data):
+        data["done_date"] = date_helpers.get_utc_now_datetime()
 
     task.update(data)
     clear_task_cache(task_id)
@@ -1195,7 +1315,10 @@ def get_or_create_status(
     is_done=False,
     is_retake=False,
     is_feedback_request=False,
-    is_default=None,
+    is_default=False,
+    for_concept=False,
+    is_artist_allowed=True,
+    is_client_allowed=True,
 ):
     """
     Create a new task status if it doesn't exist. If it exists, it returns the
@@ -1203,12 +1326,14 @@ def get_or_create_status(
     """
     if is_default:
         task_status = TaskStatus.get_by(
-            is_default=is_default,
+            is_default=is_default, for_concept=for_concept
         )
     else:
-        task_status = TaskStatus.get_by(name=name)
+        task_status = TaskStatus.get_by(name=name, for_concept=for_concept)
     if task_status is None and len(short_name) > 0:
-        task_status = TaskStatus.get_by(short_name=short_name)
+        task_status = TaskStatus.get_by(
+            short_name=short_name, for_concept=for_concept
+        )
 
     if task_status is None:
         task_status = TaskStatus.create(
@@ -1219,6 +1344,9 @@ def get_or_create_status(
             is_retake=is_retake,
             is_feedback_request=is_feedback_request,
             is_default=is_default,
+            for_concept=for_concept,
+            is_artist_allowed=is_artist_allowed,
+            is_client_allowed=is_client_allowed,
         )
         events.emit("task-status:new", {"task_status_id": task_status.id})
     return task_status.serialize()
@@ -1274,13 +1402,14 @@ def get_or_create_task_type(
             shotgun_id=shotgun_id,
         )
         events.emit("task-type:new", {"task_type_id": task_type.id})
+        clear_task_type_cache(str(task_type.id))
     return task_type.serialize()
 
 
 def create_or_update_time_spent(task_id, person_id, date, duration, add=False):
     """
     Create a new time spent if it doesn't exist. If it exists, it update it
-    with the new duratin and returns it from the database.
+    with the new duration and returns it from the database.
     """
     try:
         time_spent = TimeSpent.get_by(
@@ -1294,9 +1423,7 @@ def create_or_update_time_spent(task_id, person_id, date, duration, add=False):
     task = Task.get(task_id)
     project_id = str(task.project_id)
     if time_spent is not None:
-        if duration == 0:
-            time_spent.delete()
-        elif add:
+        if add:
             time_spent.update({"duration": time_spent.duration + duration})
         else:
             time_spent.update({"duration": duration})
@@ -1316,10 +1443,47 @@ def create_or_update_time_spent(task_id, person_id, date, duration, add=False):
             project_id=project_id,
         )
 
-    task.duration = 0
-    time_spents = TimeSpent.get_all_by(task_id=task_id)
-    for task_time_spent in time_spents:
-        task.duration += task_time_spent.duration
+    task.duration = sum(
+        time_spent.duration
+        for time_spent in TimeSpent.get_all_by(task_id=task_id)
+    )
+    task.save()
+    clear_task_cache(task_id)
+    events.emit("task:update", {"task_id": task_id}, project_id=project_id)
+
+    return time_spent.serialize()
+
+
+def delete_time_spent(task_id, person_id, date):
+    """
+    Delete time spent for given task, person and date.
+    """
+    try:
+        time_spent = TimeSpent.get_by(
+            task_id=task_id,
+            person_id=person_id,
+            date=func.cast(date, TimeSpent.date.type),
+        )
+    except DataError:
+        raise WrongDateFormatException
+
+    if time_spent is None:
+        raise TimeSpentNotFoundException
+
+    task = Task.get(task_id)
+    project_id = str(task.project_id)
+    time_spent.duration = 0
+    time_spent.delete()
+    events.emit(
+        "time-spent:delete",
+        {"time_spent_id": str(time_spent.id)},
+        project_id=project_id,
+    )
+
+    task.duration = sum(
+        time_spent.duration
+        for time_spent in TimeSpent.get_all_by(task_id=task_id)
+    )
     task.save()
     clear_task_cache(task_id)
     events.emit("task:update", {"task_id": task_id}, project_id=project_id)
@@ -1329,7 +1493,7 @@ def create_or_update_time_spent(task_id, person_id, date, duration, add=False):
 
 def is_finished(task, data):
     """
-    Return True if task status is set to done.
+    Return True if task status is set to feedback request.
     """
     if "task_status_id" in data:
         task_status = get_task_status_raw(task.task_status_id)
@@ -1338,6 +1502,18 @@ def is_finished(task, data):
             new_task_status.id != task_status.id
             and new_task_status.is_feedback_request
         )
+    else:
+        return False
+
+
+def is_done(task, data):
+    """
+    Return True if task status is set to done.
+    """
+    if "task_status_id" in data:
+        task_status = get_task_status_raw(task.task_status_id)
+        new_task_status = get_task_status_raw(data["task_status_id"])
+        return new_task_status.id != task_status.id and new_task_status.is_done
     else:
         return False
 
@@ -1380,17 +1556,16 @@ def assign_task(task_id, person_id, assigner_id=None):
     project_id = str(task.project_id)
     person = persons_service.get_person_raw(person_id)
     task.assignees.append(person)
-    task.save()
     if assigner_id is not None:
-        task.update({"assigner_id": assigner_id})
-    task_dict = task.serialize()
+        task.assigner_id = assigner_id
+    task.save()
+    task_dict = task.serialize(relations=True)
     clear_task_cache(task_id)
     events.emit(
         "task:assign",
         {"task_id": task.id, "person_id": person.id},
         project_id=project_id,
     )
-    clear_task_cache(task_id)
     events.emit("task:update", {"task_id": task_id}, project_id=project_id)
     return task_dict
 
@@ -1481,6 +1656,28 @@ def add_preview_file_to_comment(comment_id, person_id, task_id, revision=0):
     return preview_file.serialize()
 
 
+def update_preview_file_info(preview_file):
+    entity = None
+    task = get_task_raw(preview_file["task_id"])
+    if preview_file["position"] == 1:
+        task.update({"last_preview_file_id": preview_file["id"]})
+        clear_task_cache(str(task.id))
+        project = projects_service.get_project(task.project_id)
+
+        if project["is_set_preview_automated"]:
+            entity_id = str(task.entity_id)
+            entity = entities_service.update_entity_preview(
+                entity_id,
+                preview_file["id"],
+            )
+            assets_service.clear_asset_cache(entity_id)
+            edits_service.clear_edit_cache(entity_id)
+            shots_service.clear_shot_cache(entity_id)
+            shots_service.clear_episode_cache(entity_id)
+            shots_service.clear_sequence_cache(entity_id)
+    return entity
+
+
 def get_comments_for_project(project_id, page=0):
     """
     Return all comments for given project.
@@ -1501,13 +1698,33 @@ def get_time_spents_for_project(project_id, page=0):
     return query_utils.get_paginated_results(query, page)
 
 
-def get_tasks_for_project(project_id, page=0):
+def get_tasks_for_project(
+    project_id, page=0, task_type_id=None, episode_id=None
+):
     """
     Return all tasks for given project.
     """
     query = Task.query.filter(Task.project_id == project_id).order_by(
         Task.updated_at.desc()
     )
+    if task_type_id is not None:
+        query = query.filter(Task.task_type_id == task_type_id)
+    if episode_id is not None:
+        Sequence = aliased(Entity, name="sequence")
+        query = (
+            query.join(Entity, Entity.id == Task.entity_id)
+            .join(Sequence, Sequence.id == Entity.parent_id)
+            .filter(Sequence.parent_id == episode_id)
+        )
+
+        if permissions.has_vendor_permissions():
+            query = query.filter(user_service.build_assignee_filter())
+        elif not permissions.has_admin_permissions():
+            query = query.join(Project).filter(
+                user_service.build_related_projects_filter()
+            )
+        return query
+
     return query_utils.get_paginated_results(query, page, relations=True)
 
 
@@ -1576,7 +1793,12 @@ def reset_task_data(task_id):
     real_start_date = None
     last_comment_date = None
     end_date = None
-    task_status_id = get_default_status()["id"]
+    done_date = None
+    entity = entities_service.get_entity(task.entity_id)
+    task_status_id = get_default_status(
+        for_concept=entity["entity_type_id"]
+        == concepts_service.get_concept_type()["id"]
+    )["id"]
     comments = (
         Comment.query.join(TaskStatus)
         .filter(Comment.object_id == task_id)
@@ -1584,6 +1806,7 @@ def reset_task_data(task_id):
         .add_columns(
             TaskStatus.is_retake,
             TaskStatus.is_feedback_request,
+            TaskStatus.is_done,
             TaskStatus.short_name,
         )
         .all()
@@ -1594,6 +1817,7 @@ def reset_task_data(task_id):
         comment,
         task_status_is_retake,
         task_status_is_feedback_request,
+        task_status_is_done,
         task_status_short_name,
     ) in comments:
         if task_status_is_retake and not previous_is_retake:
@@ -1605,6 +1829,11 @@ def reset_task_data(task_id):
 
         if task_status_is_feedback_request:
             end_date = comment.created_at
+
+        print("ok", task_status_is_done)
+        if task_status_is_done:
+            done_date = comment.created_at
+            print(done_date)
 
         task_status_id = comment.task_status_id
         last_comment_date = comment.created_at
@@ -1621,12 +1850,13 @@ def reset_task_data(task_id):
             "real_start_date": real_start_date,
             "last_comment_date": last_comment_date,
             "end_date": end_date,
+            "done_date": done_date,
             "task_status_id": task_status_id,
         }
     )
     project_id = str(task.project_id)
     events.emit("task:update", {"task_id": task.id}, project_id)
-    return task.serialize()
+    return task.serialize(relations=True)
 
 
 def get_persons_tasks_dates():
@@ -1652,3 +1882,324 @@ def get_persons_tasks_dates():
         }
         for (person_id, min_date, max_date) in query.all()
     ]
+
+
+def get_open_tasks(
+    task_type_id=None,
+    task_status_id=None,
+    project_id=None,
+    person_id=None,
+    start_date=None,
+    due_date=None,
+    priority=None,
+    order_by=None,
+    limit=200,
+    page=None,
+):
+    """
+    Return all tasks matching given filters from open projects.
+    """
+    Sequence = aliased(Entity, name="sequence")
+    Episode = aliased(Entity, name="episode")
+
+    from zou.app import db
+
+    query_stats = (
+        db.session.query(
+            func.count().label("amount"),
+            func.sum(Task.duration).label("total_duration"),
+            func.sum(Task.estimation).label("total_estimation"),
+        )
+        .join(TaskType, Task.task_type_id == TaskType.id)
+        .join(TaskStatus, Task.task_status_id == TaskStatus.id)
+        .join(Entity, Entity.id == Task.entity_id)
+        .join(EntityType, EntityType.id == Entity.entity_type_id)
+        .join(Project, Project.id == Task.project_id)
+        .join(ProjectStatus, ProjectStatus.id == Project.project_status_id)
+        .outerjoin(Sequence, Sequence.id == Entity.parent_id)
+        .outerjoin(Episode, Episode.id == Sequence.parent_id)
+    )
+    query = (
+        Task.query.join(TaskType, Task.task_type_id == TaskType.id)
+        .join(TaskStatus, Task.task_status_id == TaskStatus.id)
+        .join(Entity, Entity.id == Task.entity_id)
+        .join(EntityType, EntityType.id == Entity.entity_type_id)
+        .join(Project, Project.id == Task.project_id)
+        .join(ProjectStatus, ProjectStatus.id == Project.project_status_id)
+        .outerjoin(Sequence, Sequence.id == Entity.parent_id)
+        .outerjoin(Episode, Episode.id == Sequence.parent_id)
+        .add_columns(
+            Project.name,
+            Project.has_avatar,
+            Entity.id,
+            Entity.name,
+            Entity.description,
+            Entity.data,
+            Entity.preview_file_id,
+            EntityType.name,
+            Entity.canceled,
+            Entity.parent_id,
+            Entity.source_id,
+            Sequence.name,
+            Episode.id,
+            Episode.name,
+            TaskType.name,
+            TaskType.for_entity,
+            TaskStatus.name,
+            TaskType.color,
+            TaskStatus.color,
+            TaskStatus.short_name,
+        )
+    ).order_by(
+        Project.name,
+        Episode.name,
+        Sequence.name,
+        EntityType.name,
+        Entity.name,
+        TaskType.name,
+    )
+
+    if project_id is not None and user_service.check_project_access(
+        project_id
+    ):
+        query = query.filter(Project.id == project_id)
+        query_stats = query_stats.filter(Project.id == project_id)
+    else:
+        if permissions.has_admin_permissions():
+            query = query.filter(ProjectStatus.name == "Open")
+            query_stats = query_stats.filter(ProjectStatus.name == "Open")
+        else:
+            query = query.filter(user_service.build_related_projects_filter())
+            query_stats = query_stats.filter(
+                user_service.build_related_projects_filter()
+            )
+
+    if task_type_id is not None:
+        query = query.filter(TaskType.id == task_type_id)
+        query_stats = query_stats.filter(TaskType.id == task_type_id)
+    else:
+        query = query.filter(TaskType.for_entity != "Concept")
+
+    if task_status_id is not None:
+        query = query.filter(TaskStatus.id == task_status_id)
+        query_stats = query_stats.filter(TaskStatus.id == task_status_id)
+
+    if person_id is not None:
+        if person_id == "unassigned":
+            query = query.filter(Task.assignees == None)
+            query_stats = query_stats.filter(Task.assignees == None)
+        else:
+            query = query.filter(Task.assignees.any(id=person_id))
+            query_stats = query_stats.filter(Task.assignees.any(id=person_id))
+
+    if start_date is not None:
+        query = query.filter(Task.start_date >= start_date)
+        query_stats = query_stats.filter(Task.start_date >= start_date)
+
+    if due_date is not None:
+        query = query.filter(Task.due_date <= due_date)
+        query_stats = query_stats.filter(Task.due_date <= due_date)
+
+    if priority is not None:
+        query = query.filter(TaskType.priority == priority)
+        query_stats = query_stats.filter(TaskType.priority == priority)
+
+    if page is not None and int(page) > 0:
+        query = query.offset((page - 1) * limit)
+
+    if order_by is not None:
+        query = query.order_by(order_by)
+
+    query_stats_status = query_stats.group_by(TaskStatus.id).add_columns(
+        TaskStatus.id
+    )
+
+    tasks = []
+
+    for (
+        task,
+        project_name,
+        project_has_avatar,
+        entity_id,
+        entity_name,
+        entity_description,
+        entity_data,
+        entity_preview_file_id,
+        entity_type_name,
+        entity_canceled,
+        entity_parent_id,
+        entity_source_id,
+        sequence_name,
+        episode_id,
+        episode_name,
+        task_type_name,
+        task_type_for_entity,
+        task_status_name,
+        task_type_color,
+        task_status_color,
+        task_status_short_name,
+    ) in query.limit(limit).all():
+        if entity_preview_file_id is None:
+            entity_preview_file_id = ""
+
+        if entity_source_id is None:
+            entity_source_id = ""
+
+        if episode_id is None:
+            episode_id = entity_source_id
+            if episode_id is not None and episode_id != "":
+                try:
+                    episode = shots_service.get_episode(episode_id)
+                    episode_name = episode["name"]
+                except EpisodeNotFoundException:
+                    episode_name = "MP"
+
+        task_dict = get_task_with_relations(str(task.id))
+        if entity_type_name == "Sequence" and entity_parent_id is not None:
+            episode_id = entity_parent_id
+            episode = shots_service.get_episode(episode_id)
+            episode_name = episode["name"]
+
+        task_dict.update(
+            {
+                "project_name": project_name,
+                "project_id": str(task.project_id),
+                "project_has_avatar": project_has_avatar,
+                "entity_id": str(entity_id),
+                "entity_name": entity_name,
+                "entity_description": entity_description,
+                "entity_data": entity_data,
+                "entity_preview_file_id": str(entity_preview_file_id),
+                "entity_source_id": str(entity_source_id),
+                "entity_type_name": entity_type_name,
+                "entity_canceled": entity_canceled,
+                "sequence_name": sequence_name,
+                "episode_id": str(episode_id),
+                "episode_name": episode_name,
+                "estimation": task.estimation,
+                "duration": task.duration,
+                "start_date": fields.serialize_value(task.start_date),
+                "due_date": fields.serialize_value(task.due_date),
+                "done_date": fields.serialize_value(task.done_date),
+                "type_name": task_type_name,
+                "task_type_for_entity": task_type_for_entity,
+                "status_name": task_status_name,
+                "type_color": task_type_color,
+                "status_color": task_status_color,
+                "status_short_name": task_status_short_name,
+            }
+        )
+        tasks.append(task_dict)
+
+    result = {
+        "data": [],
+        "stats": {
+            "total_duration": 0,
+            "total_estimation": 0,
+            "total": 0,
+            "status": [],
+        },
+        "limit": limit,
+        "is_more": False,
+        "page": page or 1,
+    }
+
+    if len(tasks) > 0:
+        count = query.count()
+        stats = query_stats.one()
+        stats_status = query_stats_status.all()
+        statuses_stats = [
+            {"task_status_id": stat.id, "amount": stat.amount}
+            for stat in stats_status
+        ]
+
+        result = {
+            "data": tasks,
+            "stats": {
+                "total_duration": stats.total_duration,
+                "total_estimation": stats.total_estimation,
+                "total": count,
+                "status": statuses_stats,
+            },
+            "limit": limit,
+            "is_more": len(tasks) == limit,
+            "page": page or 1,
+        }
+    return result
+
+
+def get_open_tasks_stats():
+    """
+    Return the amount of tasks, done tasks, estimation, and duration for each
+    status in open projects. Aggregate the amounts for each project.
+    """
+    Sequence = aliased(Entity, name="sequence")
+    Episode = aliased(Entity, name="episode")
+
+    from zou.app import db
+
+    query_stats = (
+        db.session.query(
+            func.count().label("amount"),
+            func.count(case({TaskStatus.is_done: Task.id})).label(
+                "amount_done"
+            ),
+            func.sum(Task.duration).label("total_duration"),
+            func.sum(Task.estimation).label("total_estimation"),
+        )
+        .join(TaskType, Task.task_type_id == TaskType.id)
+        .join(TaskStatus, Task.task_status_id == TaskStatus.id)
+        .join(Entity, Entity.id == Task.entity_id)
+        .join(EntityType, EntityType.id == Entity.entity_type_id)
+        .join(Project, Project.id == Task.project_id)
+        .join(ProjectStatus, ProjectStatus.id == Project.project_status_id)
+        .filter(TaskType.for_entity != "Concept")
+        .group_by(Project.id, TaskType.id, TaskStatus.id)
+        .add_columns(
+            Project.id.label("project_id"),
+            TaskType.id.label("task_type_id"),
+            TaskStatus.id.label("task_status_id"),
+        )
+    )
+
+    if permissions.has_admin_permissions():
+        query_stats = query_stats.filter(ProjectStatus.name == "Open")
+    else:
+        query_stats = query_stats.filter(
+            user_service.build_related_projects_filter()
+        )
+
+    stats_status = query_stats.all()
+
+    statuses_stats = [
+        {
+            "task_status_id": stat.task_status_id,
+            "task_type_id": stat.task_type_id,
+            "project_id": stat.project_id,
+            "amount": stat.amount,
+            "amount_done": stat.amount_done,
+            "total_duration": stat.total_duration,
+            "total_estimation": stat.total_estimation,
+        }
+        for stat in stats_status
+    ]
+
+    stats_map = {}
+    for stat in statuses_stats:
+        project_id = stat["project_id"]
+        if project_id not in stats_map:
+            stats_map[project_id] = {
+                "amount": 0,
+                "amount_done": 0,
+                "total_duration": 0,
+                "total_estimation": 0,
+                "task_types": [],
+            }
+        project_stats = stats_map[project_id]
+        project_stats["amount"] += stat["amount"]
+        project_stats["amount_done"] += stat["amount_done"]
+        project_stats["total_duration"] += stat["total_duration"]
+        project_stats["total_estimation"] += stat["total_estimation"]
+        project_stats["task_types"].append(stat)
+
+    return stats_map

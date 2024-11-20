@@ -2,6 +2,7 @@ from flask import Blueprint
 from zou.app.utils.api import configure_api_from_blueprint
 
 from zou.app.blueprints.previews.resources import (
+    AttachmentThumbnailResource,
     CreatePreviewFilePictureResource,
     PreviewFileLowMovieResource,
     PreviewFileMovieResource,
@@ -12,18 +13,22 @@ from zou.app.blueprints.previews.resources import (
     PreviewFileThumbnailSquareResource,
     PreviewFilePreviewResource,
     PreviewFileOriginalResource,
-    CreateOrganisationThumbnailResource,
+    PreviewFileTileResource,
     OrganisationThumbnailResource,
-    CreateProjectThumbnailResource,
+    CreateOrganisationThumbnailResource,
     ProjectThumbnailResource,
-    CreatePersonThumbnailResource,
+    CreateProjectThumbnailResource,
     PersonThumbnailResource,
+    CreatePersonThumbnailResource,
     RunningPreviewFiles,
-    LegacySetMainPreviewResource,
     SetMainPreviewResource,
     UpdateAnnotationsResource,
     UpdatePreviewPositionResource,
     ExtractFrameFromPreview,
+    ExtractTileFromPreview,
+    CreatePreviewBackgroundFileResource,
+    PreviewBackgroundFileThumbnailResource,
+    PreviewBackgroundFileResource,
 )
 
 routes = [
@@ -49,6 +54,10 @@ routes = [
         PreviewFileThumbnailResource,
     ),
     (
+        "/pictures/thumbnails/attachment-files/<attachment_file_id>.png",
+        AttachmentThumbnailResource,
+    ),
+    (
         "/pictures/thumbnails-square/preview-files/<instance_id>.png",
         PreviewFileThumbnailSquareResource,
     ),
@@ -67,6 +76,10 @@ routes = [
     (
         "/pictures/previews/preview-files/<instance_id>.png",
         PreviewFilePreviewResource,
+    ),
+    (
+        "/movies/tiles/preview-files/<instance_id>.png",
+        PreviewFileTileResource,
     ),
     (
         "/pictures/thumbnails/organisations/<instance_id>",
@@ -93,15 +106,23 @@ routes = [
         ProjectThumbnailResource,
     ),
     (
-        "/actions/entities/<entity_id>/set-main-preview/<preview_file_id>",
-        LegacySetMainPreviewResource,
+        "/pictures/preview-background-files/<instance_id>",
+        CreatePreviewBackgroundFileResource,
+    ),
+    (
+        "/pictures/thumbnails/preview-background-files/<instance_id>.png",
+        PreviewBackgroundFileThumbnailResource,
+    ),
+    (
+        "/pictures/preview-background-files/<instance_id>.<extension>",
+        PreviewBackgroundFileResource,
     ),
     (
         "/actions/preview-files/<preview_file_id>/set-main-preview",
         SetMainPreviewResource,
     ),
     (
-        "/data/preview-files/<preview_file_id>/extract-frame",
+        "/actions/preview-files/<preview_file_id>/extract-frame",
         ExtractFrameFromPreview,
     ),
     (
@@ -111,6 +132,10 @@ routes = [
     (
         "/actions/preview-files/<preview_file_id>/update-annotations",
         UpdateAnnotationsResource,
+    ),
+    (
+        "/actions/preview-files/<preview_file_id>/extract-tile",
+        ExtractTileFromPreview,
     ),
 ]
 blueprint = Blueprint("thumbnails", "thumbnails")

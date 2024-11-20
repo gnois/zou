@@ -1,27 +1,32 @@
 # coding: utf-8
 
 import os
-import json
 import datetime
 import tempfile
+import sys
+import shutil
 
 
 from ldap3 import Server, Connection, ALL, NTLM, SIMPLE
-from zou.app.utils import thumbnail as thumbnail_utils
-from zou.app.stores import auth_tokens_store, file_store
+from zou.app.utils import thumbnail as thumbnail_utils, auth
+from zou.app.stores import auth_tokens_store, file_store, queue_store
 from zou.app.services import (
     assets_service,
     backup_service,
+    breakdown_service,
     deletion_service,
     edits_service,
     index_service,
     persons_service,
+    preview_files_service,
     projects_service,
     shots_service,
     sync_service,
     tasks_service,
 )
 from zou.app.models.person import Person
+from zou.app.models.preview_file import PreviewFile
+from zou.app.models.task import Task
 from sqlalchemy.sql.expression import not_
 
 from zou.app.services.exception import (
@@ -36,21 +41,12 @@ from zou.app import app
 
 def clean_auth_tokens():
     """
-    Remove all revoked tokens (most of the time outdated) from the key value
+    Remove all revoked tokens from the key value
     store.
     """
     for key in auth_tokens_store.keys():
-        value = json.loads(auth_tokens_store.get(key))
-
-        if isinstance(value, bool):
+        if auth_tokens_store.is_revoked(key):
             auth_tokens_store.delete(key)
-        else:
-            is_revoked = value["revoked"] == True
-            expiration = datetime.datetime.fromtimestamp(value["token"]["exp"])
-            is_expired = expiration < datetime.datetime.utcnow()
-
-            if is_revoked or is_expired:
-                auth_tokens_store.delete(key)
 
 
 def clear_all_auth_tokens():
@@ -160,6 +156,11 @@ def init_data():
             priority=8,
             for_entity="Edit",
         )
+
+        tasks_service.get_or_create_task_type(
+            concept, "Concept", "#8D6E63", 1, for_entity="Concept"
+        )
+
         print("Task types initialized.")
 
         tasks_service.get_default_status()
@@ -177,6 +178,34 @@ def init_data():
         )
         tasks_service.get_or_create_status(
             "Ready To Start", "ready", "#fbc02d"
+        )
+
+        tasks_service.get_or_create_status(
+            "Neutral",
+            "neutral",
+            "#CCCCCC",
+            is_default=True,
+            for_concept=True,
+            is_artist_allowed=True,
+            is_client_allowed=True,
+        )
+
+        tasks_service.get_or_create_status(
+            "Approved",
+            "approved",
+            "#66BB6A",
+            for_concept=True,
+            is_artist_allowed=True,
+            is_client_allowed=True,
+        )
+
+        tasks_service.get_or_create_status(
+            "Rejected",
+            "rejected",
+            "#E81123",
+            for_concept=True,
+            is_artist_allowed=True,
+            is_client_allowed=True,
         )
 
         print("Task status initialized.")
@@ -209,8 +238,11 @@ def sync_with_ldap_server():
         is_ad = LDAP_IS_AD or LDAP_IS_AD_SIMPLE
         attributes = ["givenName", "sn", "mail", "cn"]
         if is_ad:
+            if LDAP_IS_AD_SIMPLE:
+                attributes += ["cn"]
+            else:
+                attributes += ["sAMAccountName"]
             attributes += [
-                "sAMAccountName",
                 "thumbnailPhoto",
                 "userAccountControl",
                 "objectGUID",
@@ -239,11 +271,16 @@ def sync_with_ldap_server():
         conn.search(LDAP_BASE_DN, query, attributes=attributes)
         ldap_users = []
         for entry in conn.entries:
-            if (
-                clean_value(entry.sAMAccountName if is_ad else entry.uid)
-                not in excluded_accounts
-                and group_members is None
-                or entry.entry_dn in group_members
+            if LDAP_IS_AD_SIMPLE:
+                desktop_login = entry.cn
+            elif LDAP_IS_AD:
+                desktop_login = entry.sAMAccountName
+            else:
+                desktop_login = entry.uid
+            desktop_login = clean_value(desktop_login)
+
+            if desktop_login not in excluded_accounts and (
+                group_members is None or entry.entry_dn in group_members
             ):
                 if is_ad:
                     ldap_uid = clean_value(entry.objectGUID)
@@ -258,10 +295,6 @@ def sync_with_ldap_server():
                     thumbnail = thumbnails[0]
                 else:
                     thumbnail = None
-
-                desktop_login = clean_value(
-                    entry.sAMAccountName if is_ad else entry.uid
-                )
 
                 emails = entry.mail.values
                 if len(emails) == 0:
@@ -361,7 +394,9 @@ def sync_with_ldap_server():
             )
             .all()
         ):
-            persons_service.update_person(person.id, {"active": False})
+            persons_service.update_person(
+                person.id, {"active": False}, bypass_protected_accounts=True
+            )
             print(
                 "User %s disabled (not found in LDAP)." % person.desktop_login
             )
@@ -385,6 +420,7 @@ def sync_with_ldap_server():
                         "desktop_login": user["desktop_login"],
                         "ldap_uid": user["ldap_uid"],
                     },
+                    bypass_protected_accounts=True,
                 )
                 print(f"User {user['desktop_login']} updated.")
             except IsUserLimitReachedException:
@@ -437,14 +473,16 @@ def sync_with_ldap_server():
         )
         file_store.add_picture("thumbnails", person["id"], thumbnail_png_path)
         os.remove(thumbnail_png_path)
-        persons_service.update_person(person["id"], {"has_avatar": True})
+        persons_service.update_person(
+            person["id"], {"has_avatar": True}, bypass_protected_accounts=True
+        )
 
     ldap_users = get_ldap_users()
     update_person_list_with_ldap_users(ldap_users)
 
 
 def import_data_from_another_instance(
-    target,
+    source,
     login,
     password,
     project=None,
@@ -457,22 +495,24 @@ def import_data_from_another_instance(
     change the IDs.
     """
     with app.app_context():
-        sync_service.init(target, login, password)
+        sync_service.init(source, login, password)
         if not only_projects:
             sync_service.run_main_data_sync(project=project)
         if not no_projects:
             sync_service.run_project_data_sync(project=project)
-            sync_service.run_other_sync(project=project)
+            sync_service.run_other_sync(
+                project=project, with_events=with_events
+            )
 
 
-def run_sync_change_daemon(event_target, target, login, password, logs_dir):
+def run_sync_change_daemon(event_source, source, login, password, logs_dir):
     """
     Listen to event websocket. Each time a change occurs, it retrieves the
     related data and save it in the current instance.
     """
     with app.app_context():
         event_client = sync_service.init_events_listener(
-            target, event_target, login, password, logs_dir
+            source, event_source, login, password, logs_dir
         )
         sync_service.add_main_sync_listeners(event_client)
         sync_service.add_project_sync_listeners(event_client)
@@ -482,7 +522,7 @@ def run_sync_change_daemon(event_target, target, login, password, logs_dir):
 
 
 def run_sync_file_change_daemon(
-    event_target, target, login, password, logs_dir
+    event_source, source, login, password, logs_dir
 ):
     """
     Listen to event websocket. Each time a change occurs, it retrieves the
@@ -490,7 +530,7 @@ def run_sync_file_change_daemon(
     """
     with app.app_context():
         event_client = sync_service.init_events_listener(
-            target, event_target, login, password, logs_dir
+            source, event_source, login, password, logs_dir
         )
         sync_service.add_file_listeners(event_client)
         print("Start listening.")
@@ -498,21 +538,21 @@ def run_sync_file_change_daemon(
 
 
 def import_last_changes_from_another_instance(
-    target, login, password, minutes=0, page_size=300
+    source, login, password, minutes=0, page_size=300
 ):
     """
     Retrieve and save all the data related to most recent events from another
     API instance. It doesn't change the IDs.
     """
     with app.app_context():
-        sync_service.init(target, login, password)
+        sync_service.init(source, login, password)
         print("Last events syncing started.")
         sync_service.run_last_events_sync(minutes=minutes, page_size=300)
         print("Last events syncing ended.")
 
 
 def import_last_file_changes_from_another_instance(
-    target, login, password, minutes=20, page_size=50, force=False
+    source, login, password, minutes=20, page_size=50, force=False
 ):
     """
     Retrieve and save all the data related most to recent file events
@@ -520,37 +560,36 @@ def import_last_file_changes_from_another_instance(
     It doesn't change the IDs.
     """
     with app.app_context():
-        sync_service.init(target, login, password)
+        sync_service.init(source, login, password)
         print("Last files syncing started.")
         sync_service.run_last_events_files(minutes=minutes, page_size=50)
         print("Last files syncing ended.")
 
 
 def import_files_from_another_instance(
-    target,
+    source,
     login,
     password,
     project=None,
     multithreaded=False,
     number_workers=30,
     number_attemps=3,
+    force_resync=False,
 ):
     """
     Retrieve and save all the data related most recent events from another API
     instance. It doesn't change the IDs.
     """
     with app.app_context():
-        if multithreaded:
-            # allow poolsize in swift client HTTPSession to allow more than 10 simultaneous connections.
-            from requests import adapters
-
-            adapters.DEFAULT_POOLSIZE = number_workers
-        sync_service.init(target, login, password)
-        sync_service.download_files_from_another_instance(
+        sync_service.init(
+            source, login, password, multithreaded, number_workers
+        )
+        return sync_service.download_files_from_another_instance(
             project=project,
             multithreaded=multithreaded,
             number_workers=number_workers,
             number_attemps=number_attemps,
+            force_resync=force_resync,
         )
 
 
@@ -623,3 +662,152 @@ def search_asset(query):
         for asset in assets:
             print(asset["name"], asset["id"])
         return assets
+
+
+def generate_preview_extra(
+    project=None,
+    entity_id=None,
+    episodes=[],
+    only_shots=False,
+    only_assets=False,
+    force_regenerate_tiles=False,
+    with_tiles=False,
+    with_metadata=False,
+    with_thumbnails=False,
+):
+    with app.app_context():
+        preview_files_service.generate_preview_extra(
+            project=project,
+            entity_id=entity_id,
+            episodes=episodes,
+            only_shots=only_shots,
+            only_assets=only_assets,
+            force_regenerate_tiles=force_regenerate_tiles,
+            with_thumbnails=with_thumbnails,
+            with_metadata=with_metadata,
+            with_tiles=with_tiles,
+        )
+
+
+def reset_movie_files_metadata():
+    with app.app_context():
+        preview_files_service.reset_movie_files_metadata()
+
+
+def reset_picture_files_metadata():
+    with app.app_context():
+        preview_files_service.reset_picture_files_metadata()
+
+
+def reset_breakdown_data():
+    with app.app_context():
+        print("Resetting breakdown data for all open projects.")
+        breakdown_service.refresh_all_shot_casting_stats()
+        print("Resetting done.")
+
+
+def create_bot(
+    email,
+    name,
+    expiration_date,
+    role,
+):
+    with app.app_context():
+        # Allow "admin@example.com" to be invalid.
+        if email != "admin@example.com":
+            auth.validate_email(email)
+        bot = persons_service.create_person(
+            email=email,
+            password=None,
+            first_name=name,
+            last_name="",
+            expiration_date=expiration_date,
+            role=role,
+            is_bot=True,
+        )
+        print(bot["access_token"])
+
+
+def renormalize_movie_preview_files(
+    preview_file_id=None, project_id=None, all_broken=None, all_processing=None
+):
+    with app.app_context():
+        if preview_file_id is None and not all_broken and not all_processing:
+            print("You must specify at least one option.")
+            sys.exit(1)
+        else:
+            query = PreviewFile.query.filter(
+                PreviewFile.extension == "mp4"
+            ).order_by(PreviewFile.created_at.asc())
+
+            if preview_file_id is not None:
+                query = query.filter(PreviewFile.id == preview_file_id)
+
+            if project_id is not None:
+                query = query.join(Task).filter(
+                    PreviewFile.project_id == project_id
+                )
+
+            if all_broken and all_processing:
+                query = query.filter(
+                    PreviewFile.status.in_(("broken", "processing"))
+                )
+            elif all_broken:
+                query = query.filter(PreviewFile.status == "broken")
+            elif all_processing:
+                query = query.filter(PreviewFile.status == "processing")
+
+            preview_files = query.all()
+            len_preview_files = len(preview_files)
+            if len_preview_files == 0:
+                print("No preview files found.")
+                sys.exit(1)
+            else:
+                for i, preview_file in enumerate(preview_files):
+                    try:
+                        preview_file_id = str(preview_file.id)
+                        print(
+                            f"Renormalizing preview file {preview_file_id} ({i+1}/{len_preview_files})."
+                        )
+                        extension = preview_file.extension
+                        uploaded_movie_path = os.path.join(
+                            config.TMP_DIR,
+                            f"{preview_file_id}.{extension}.tmp",
+                        )
+                        if config.FS_BACKEND == "local":
+                            shutil.copyfile(
+                                file_store.get_local_movie_path(
+                                    "source", preview_file_id
+                                ),
+                                uploaded_movie_path,
+                            )
+                        else:
+                            sync_service.download_file(
+                                uploaded_movie_path,
+                                "source",
+                                file_store.open_movie,
+                                str(preview_file_id),
+                            )
+                        if config.ENABLE_JOB_QUEUE:
+                            queue_store.job_queue.enqueue(
+                                preview_files_service.prepare_and_store_movie,
+                                args=(
+                                    preview_file_id,
+                                    uploaded_movie_path,
+                                    True,
+                                    False,
+                                ),
+                                job_timeout=int(config.JOB_QUEUE_TIMEOUT),
+                            )
+                        else:
+                            preview_files_service.prepare_and_store_movie(
+                                preview_file_id,
+                                uploaded_movie_path,
+                                normalize=True,
+                                add_source_to_file_store=False,
+                            )
+                    except Exception as e:
+                        print(
+                            f"Renormalization of preview file {preview_file_id} failed: {e}"
+                        )
+                        continue

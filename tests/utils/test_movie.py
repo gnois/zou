@@ -2,6 +2,8 @@ import os
 import shutil
 import tempfile
 import unittest
+from PIL import Image
+import math
 
 from pathlib import Path
 from urllib import request
@@ -22,6 +24,7 @@ class MovieTestCase(unittest.TestCase):
         request.urlretrieve(test_url, self.video_only_path)
 
     def tearDown(self):
+        super(MovieTestCase, self).tearDown()
         shutil.rmtree(self.tmpdir)
 
     def test_soundtrack(self):
@@ -123,3 +126,23 @@ class MovieTestCase(unittest.TestCase):
         width_playlist, height_playlist = movie.get_movie_size(out)
         self.assertEqual(width, width_playlist)
         self.assertEqual(height, height_playlist)
+
+    def test_create_tile(self):
+        video_path = "./tests/fixtures/videos/test_preview_tiles.mp4"
+        tile_path = movie.generate_tile(video_path)
+        image = Image.open(tile_path)
+        img_width, img_height = image.size
+        os.remove(tile_path)
+
+        video_track = movie.get_video_track(video_path, "generate_tile")
+        duration = movie.get_movie_duration(video_track=video_track)
+        fps = movie.get_movie_fps(video_track=video_track)
+        duration_in_frames = int(duration * fps)
+        rows = min(math.ceil(duration_in_frames / 8), 240)
+        display_aspect_ratio = movie.get_movie_display_aspect_ratio(
+            video_track=video_track
+        )
+        target_width = math.ceil(display_aspect_ratio * 100)
+
+        self.assertEqual(img_width, target_width * 8)
+        self.assertEqual(img_height, 100 * rows)

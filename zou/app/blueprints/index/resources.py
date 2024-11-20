@@ -1,16 +1,15 @@
 import psutil
 import redis
 import requests
-
-from datetime import datetime
+import datetime
 
 from flask import Response, abort
 from flask_restful import Resource
 from zou import __version__
 
 from zou.app import app, config
-from zou.app.utils import permissions, shell
-from zou.app.services import projects_service, stats_service
+from zou.app.utils import permissions, shell, date_helpers
+from zou.app.services import projects_service, stats_service, persons_service
 
 from flask_jwt_extended import jwt_required
 
@@ -26,7 +25,7 @@ class IndexResource(Resource):
             200:
                 description: API name and version
         """
-        return {"api": app.config["APP_NAME"], "version": __version__}
+        return {"api": config.APP_NAME, "version": __version__}
 
 
 class BaseStatusResource(Resource):
@@ -43,6 +42,7 @@ class BaseStatusResource(Resource):
                 host=config.KEY_VALUE_STORE["host"],
                 port=config.KEY_VALUE_STORE["port"],
                 db=config.AUTH_TOKEN_BLACKLIST_KV_INDEX,
+                password=config.KEY_VALUE_STORE["password"],
                 decode_responses=True,
             )
             store.get("test")
@@ -65,7 +65,11 @@ class BaseStatusResource(Resource):
             host = config.KEY_VALUE_STORE["host"]
             port = config.KEY_VALUE_STORE["port"]
             db = config.KV_JOB_DB_INDEX
-            url = "redis://%s:%s/%s" % (host, port, db)
+            password = config.KEY_VALUE_STORE["password"]
+            if password:
+                url = "redis://:%s@%s:%s/%s" % (password, host, port, db)
+            else:
+                url = "redis://%s:%s/%s" % (host, port, db)
             args = ["rq", "info", "--url", url]
             out = shell.run_command(args)
             is_jq_up = b"0 workers" not in out
@@ -87,10 +91,8 @@ class BaseStatusResource(Resource):
 
         version = __version__
 
-        api_name = app.config["APP_NAME"]
-
         return (
-            api_name,
+            config.APP_NAME,
             version,
             is_db_up,
             is_kv_up,
@@ -231,8 +233,8 @@ class InfluxStatusResource(BaseStatusResource):
                 description: Status of database, key value, event stream, job queue and time
         """
         (
-            api_name,
-            version,
+            _,
+            _,
             is_db_up,
             is_kv_up,
             is_es_up,
@@ -246,7 +248,9 @@ class InfluxStatusResource(BaseStatusResource):
             "event-stream-up": int(is_es_up),
             "job-queue-up": int(is_jq_up),
             "indexer-up": int(is_indexer_up),
-            "time": datetime.timestamp(datetime.utcnow()),
+            "time": datetime.datetime.timestamp(
+                date_helpers.get_utc_now_datetime()
+            ),
         }
 
 
@@ -272,18 +276,48 @@ class StatsResource(Resource):
 class ConfigResource(Resource):
     def get(self):
         """
-        Get crisp token.
+        Get basic configuration for the current instance.
         ---
         tags:
           - Index
         responses:
             200:
-                description: Crisp token
+                description: Configuration object including self-hosted status,
+                    Crisp token, indexer configuration, SAML status, and dark
+                    theme status.
         """
-        return {
-            "crisp_token": app.config["CRISP_TOKEN"],
+        organisation = persons_service.get_organisation()
+        conf = {
+            "is_self_hosted": config.IS_SELF_HOSTED,
+            "crisp_token": config.CRISP_TOKEN,
+            "dark_theme_by_default": organisation["dark_theme_by_default"],
             "indexer_configured": (
-                len(app.config["INDEXER"]["key"]) > 0
-                and app.config["INDEXER"]["key"] != "masterkey"
+                len(config.INDEXER["key"]) > 0
+                and config.INDEXER["key"] != "masterkey"
             ),
+            "saml_enabled": config.SAML_ENABLED,
+            "saml_idp_name": config.SAML_IDP_NAME,
         }
+        if config.SENTRY_KITSU_ENABLED:
+            conf["sentry"] = {
+                "dsn": config.SENTRY_KITSU_DSN,
+                "sampleRate": config.SENTRY_KITSU_SR,
+            }
+        return conf
+
+
+class TestEventsResource(Resource):
+    def get(self):
+        """
+        Generate a main:test event.
+        ---
+        tags:
+          - Index
+        responses:
+            200:
+                description: Success flage
+        """
+        from zou.app.utils import events
+
+        events.emit("main:test", data={}, persist=False, project_id=None)
+        return {"success": True}

@@ -1,4 +1,4 @@
-import json
+import orjson as json
 
 from tests.base import ApiDBTestCase
 
@@ -24,16 +24,10 @@ class AuthTestCase(ApiDBTestCase):
             "email": self.person_dict["email"],
             "password": "secretpassword",
         }
-        try:
-            self.get("auth/logout")
-        except AssertionError:
-            pass
 
     def tearDown(self):
-        try:
-            self.get("auth/logout")
-        except AssertionError:
-            pass
+        self.log_out()
+        super(AuthTestCase, self).tearDown()
 
     def get_auth_headers(self, tokens):
         return {
@@ -74,7 +68,7 @@ class AuthTestCase(ApiDBTestCase):
     def test_unactive_login(self):
         self.person.update({"active": False})
         self.person.save()
-        tokens = self.post("auth/login", self.credentials, 400)
+        tokens = self.post("auth/login", self.credentials, 401)
         self.assertIsNotAuthenticated(tokens, 422)
         self.logout(tokens)
 
@@ -253,7 +247,7 @@ class AuthTestCase(ApiDBTestCase):
 
     def test_unactive(self):
         self.person.update({"active": False})
-        self.post("auth/login", self.credentials, 400)
+        self.post("auth/login", self.credentials, 401)
 
         self.person.update({"active": True})
         self.person.save()

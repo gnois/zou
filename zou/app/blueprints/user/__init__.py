@@ -1,5 +1,7 @@
 from flask import Blueprint
+from flask_jwt_extended import jwt_required
 from zou.app.utils.api import configure_api_from_blueprint
+from zou.app.utils import permissions
 
 from zou.app.blueprints.user.resources import (
     AssetTasksResource,
@@ -9,6 +11,8 @@ from zou.app.blueprints.user.resources import (
     ContextResource,
     DateTimeSpentsResource,
     DayOffResource,
+    ChatsResource,
+    JoinChatResource,
     OpenProjectsResource,
     ProjectEpisodesResource,
     ProjectSequencesResource,
@@ -25,8 +29,11 @@ from zou.app.blueprints.user.resources import (
     TodosResource,
     DoneResource,
     FilterResource,
-    DesktopLoginLogsResource,
     FiltersResource,
+    FilterGroupResource,
+    FilterGroupsResource,
+    DesktopLoginLogsResource,
+    MarkAllNotificationsAsReadResource,
     NotificationsResource,
     NotificationResource,
     HasTaskSubscribedResource,
@@ -71,6 +78,8 @@ routes = [
     ("/data/user/done-tasks", DoneResource),
     ("/data/user/filters", FiltersResource),
     ("/data/user/filters/<filter_id>", FilterResource),
+    ("/data/user/filter-groups", FilterGroupsResource),
+    ("/data/user/filter-groups/<filter_group_id>", FilterGroupResource),
     ("/data/user/desktop-login-logs", DesktopLoginLogsResource),
     ("/data/user/time-spents", TimeSpentsResource),
     ("/data/user/time-spents/<date>", DateTimeSpentsResource),
@@ -79,6 +88,8 @@ routes = [
     ("/data/user/notifications", NotificationsResource),
     ("/data/user/notifications/<notification_id>", NotificationResource),
     ("/data/user/tasks/<task_id>/subscribed", HasTaskSubscribedResource),
+    ("/data/user/chats", ChatsResource),
+    ("/actions/user/chats/<entity_id>/join", JoinChatResource),
     ("/actions/user/tasks/<task_id>/subscribe", TaskSubscribeResource),
     ("/actions/user/tasks/<task_id>/unsubscribe", TaskUnsubscribeResource),
     ("/actions/user/clear-avatar", ClearAvatarResource),
@@ -98,7 +109,18 @@ routes = [
         "/actions/user/sequences/<sequence_id>/task-types/<task_type_id>/unsubscribe",
         SequenceUnsubscribeResource,
     ),
+    (
+        "/actions/user/notifications/mark-all-as-read",
+        MarkAllNotificationsAsReadResource,
+    ),
 ]
 
 blueprint = Blueprint("user", "user")
-api = configure_api_from_blueprint(blueprint, routes)
+api = configure_api_from_blueprint(
+    blueprint,
+    routes,
+    decorators=[
+        jwt_required(),
+        permissions.require_person,
+    ],
+)

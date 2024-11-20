@@ -13,6 +13,7 @@ from zou.app.models.task_type import TaskType
 from zou.app.models.time_spent import TimeSpent
 from zou.app.models.entity import Entity
 from zou.app.models.entity_type import EntityType
+from zou.app.models.person import Person
 
 from zou.app.utils import fields, date_helpers
 
@@ -32,7 +33,9 @@ def get_time_spents_for_entity(entity_id):
     return TimeSpent.serialize_list(query.all())
 
 
-def get_year_table(person_id=None, project_id=None, department_ids=None):
+def get_year_table(
+    person_id=None, project_id=None, department_ids=None, studio_id=None
+):
     """
     Return a table giving time spent by user and by month for given year.
     """
@@ -42,11 +45,12 @@ def get_year_table(person_id=None, project_id=None, department_ids=None):
         person_id=person_id,
         project_id=project_id,
         department_ids=department_ids,
+        studio_id=studio_id,
     )
 
 
 def get_month_table(
-    year, person_id=None, project_id=None, department_ids=None
+    year, person_id=None, project_id=None, department_ids=None, studio_id=None
 ):
     """
     Return a table giving time spent by user and by month for given year.
@@ -56,10 +60,13 @@ def get_month_table(
         person_id=person_id,
         project_id=project_id,
         department_ids=department_ids,
+        studio_id=studio_id,
     )
 
 
-def get_week_table(year, person_id=None, project_id=None, department_ids=None):
+def get_week_table(
+    year, person_id=None, project_id=None, department_ids=None, studio_id=None
+):
     """
     Return a table giving time spent by user and by week for given year.
     """
@@ -69,11 +76,17 @@ def get_week_table(year, person_id=None, project_id=None, department_ids=None):
         person_id=person_id,
         project_id=project_id,
         department_ids=department_ids,
+        studio_id=studio_id,
     )
 
 
 def get_day_table(
-    year, month, person_id=None, project_id=None, department_ids=None
+    year,
+    month,
+    person_id=None,
+    project_id=None,
+    department_ids=None,
+    studio_id=None,
 ):
     """
     Return a table giving time spent by user and by day for given year and
@@ -85,6 +98,7 @@ def get_day_table(
         person_id=person_id,
         project_id=project_id,
         department_ids=department_ids,
+        studio_id=studio_id,
     )
     return get_table_from_time_spents(time_spents, "day")
 
@@ -95,6 +109,7 @@ def get_yearly_table(
     person_id=None,
     project_id=None,
     department_ids=None,
+    studio_id=None,
 ):
     """
     Return a table giving time spent by user and by week or month for given
@@ -106,12 +121,17 @@ def get_yearly_table(
         person_id=person_id,
         project_id=project_id,
         department_ids=department_ids,
+        studio_id=studio_id,
     )
     return get_table_from_time_spents(time_spents, detail_level)
 
 
 def get_time_spents_for_year(
-    year=None, person_id=None, project_id=None, department_ids=None
+    year=None,
+    person_id=None,
+    project_id=None,
+    department_ids=None,
+    studio_id=None,
 ):
     """
     Return all time spents for given year.
@@ -138,16 +158,26 @@ def get_time_spents_for_year(
         else:
             query = query.filter(Task.project_id == project_id)
 
-    if department_ids is not None:
+    if department_ids:
         query = query.join(TaskType).filter(
             TaskType.department_id.in_(department_ids)
+        )
+
+    if studio_id is not None:
+        query = query.join(Person, Person.id == TimeSpent.person_id).filter(
+            Person.studio_id == studio_id
         )
 
     return query.all()
 
 
 def get_time_spents_for_month(
-    year, month, person_id=None, project_id=None, department_ids=None
+    year,
+    month,
+    person_id=None,
+    project_id=None,
+    department_ids=None,
+    studio_id=None,
 ):
     """
     Return all time spents for given month.
@@ -170,9 +200,15 @@ def get_time_spents_for_month(
         else:
             query = query.filter(Task.project_id == project_id)
 
-    if department_ids is not None:
-        query = query.join(TaskType)
-        query = query.filter(TaskType.department_id.in_(department_ids))
+    if department_ids:
+        query = query.join(TaskType).filter(
+            TaskType.department_id.in_(department_ids)
+        )
+
+    if studio_id is not None:
+        query = query.join(Person, Person.id == TimeSpent.person_id).filter(
+            Person.studio_id == studio_id
+        )
 
     return query.all()
 
@@ -219,7 +255,7 @@ def get_time_spents(
         if project_ids is not None:
             query = query.filter(Task.project_id.in_(project_ids))
 
-        if department_ids is not None:
+        if department_ids:
             query = query.join(TaskType)
             query = query.filter(TaskType.department_id.in_(department_ids))
     except DataError:
@@ -268,7 +304,10 @@ def get_day_off(person_id, date):
     """
     try:
         day_off = DayOff.get_by(
-            person_id=person_id, date=func.cast(date, TimeSpent.date.type)
+            func.cast(date, DayOff.date.type).between(
+                DayOff.date, DayOff.end_date
+            ),
+            person_id=person_id,
         )
     except DataError:
         raise WrongDateFormatException
@@ -391,7 +430,7 @@ def get_person_time_spent_entries(
         else:
             query = query.filter(Task.project_id == project_id)
 
-    if department_ids is not None:
+    if department_ids:
         query = query.join(TaskType, TaskType.id == Task.task_type_id).filter(
             TaskType.department_id.in_(department_ids)
         )
@@ -467,19 +506,27 @@ def get_person_day_offs_for_year(person_id, year):
     return get_day_offs_between(start, end, person_id=person_id)
 
 
-def get_day_offs_between(start, end, person_id=None):
+def get_day_offs_between(
+    start=None, end=None, person_id=None, exclude_id=None
+):
     """
-    Get all day off entries for given person, year.
+    Get all day off entries for given person, start and end date.
     """
     query = DayOff.query
     if person_id is not None:
         query = query.filter(DayOff.person_id == person_id)
 
-    return DayOff.serialize_list(
-        query.filter(DayOff.date >= func.cast(start, TimeSpent.date.type))
-        .filter(DayOff.date < func.cast(end, TimeSpent.date.type))
-        .all()
-    )
+    if start is not None:
+        query = query.filter(
+            func.cast(start, DayOff.end_date.type) <= DayOff.end_date
+        )
+    if end is not None:
+        query = query.filter(func.cast(end, DayOff.date.type) >= DayOff.date)
+
+    if exclude_id is not None:
+        query = query.filter(DayOff.id != exclude_id)
+
+    return DayOff.serialize_list(query.all())
 
 
 def get_timezoned_interval(start, end):

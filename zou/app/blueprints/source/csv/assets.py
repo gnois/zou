@@ -5,16 +5,22 @@ from zou.app.blueprints.source.csv.base import (
 from zou.app.models.project import ProjectTaskTypeLink
 from zou.app.models.task_type import TaskType
 
-from zou.app.services import assets_service, projects_service, shots_service
+from zou.app.services import (
+    assets_service,
+    projects_service,
+    shots_service,
+    persons_service,
+    comments_service,
+    index_service,
+    tasks_service,
+)
 from zou.app.models.entity import Entity
-from zou.app.services import comments_service, index_service, tasks_service
-from zou.app.services.persons_service import get_current_user
 from zou.app.services.exception import WrongParameterException
 from zou.app.utils import events, cache
 
 
 class AssetsCsvImportResource(BaseCsvProjectImportResource):
-    def post(self, project_id, **kwargs):
+    def post(self, project_id):
         """
         Import project assets via a .csv file.
         ---
@@ -39,7 +45,7 @@ class AssetsCsvImportResource(BaseCsvProjectImportResource):
             400:
                 description: The .csv file is not properly formatted.
         """
-        return super().post(project_id, **kwargs)
+        return super().post(project_id)
 
     def prepare_import(self, project_id):
         self.episodes = {}
@@ -64,7 +70,7 @@ class AssetsCsvImportResource(BaseCsvProjectImportResource):
             status["id"]: [status[n].lower() for n in ("name", "short_name")]
             for status in tasks_service.get_task_statuses()
         }
-        self.current_user_id = get_current_user()["id"]
+        self.current_user_id = persons_service.get_current_user()["id"]
         self.task_types_for_ready_for_map = {
             task_type.name: str(task_type.id)
             for task_type in TaskType.query.join(ProjectTaskTypeLink)
@@ -160,13 +166,9 @@ class AssetsCsvImportResource(BaseCsvProjectImportResource):
 
         if self.is_tv_show:
             if episode_name not in [None, "MP"] + list(self.episodes.keys()):
-                self.episodes[
-                    episode_name
-                ] = shots_service.get_or_create_episode(
-                    project_id, episode_name
-                )[
-                    "id"
-                ]
+                self.episodes[episode_name] = shots_service.create_episode(
+                    project_id, episode_name, created_by=self.current_user_id
+                )["id"]
             episode_id = self.episodes.get(episode_name, None)
         elif episode_name is not None:
             raise RowException(
@@ -217,9 +219,9 @@ class AssetsCsvImportResource(BaseCsvProjectImportResource):
                 asset_new_values["ready_for"] = None
             else:
                 try:
-                    asset_new_values[
-                        "ready_for"
-                    ] = self.task_types_for_ready_for_map[ready_for]
+                    asset_new_values["ready_for"] = (
+                        self.task_types_for_ready_for_map[ready_for]
+                    )
                 except KeyError:
                     raise RowException(
                         "Task type not found for %s" % ready_for
@@ -228,7 +230,10 @@ class AssetsCsvImportResource(BaseCsvProjectImportResource):
         tasks_update = self.get_tasks_update(row)
 
         if entity is None:
-            entity = Entity.create(**{**asset_values, **asset_new_values})
+            entity = Entity.create(
+                **{**asset_values, **asset_new_values},
+                created_by=self.current_user_id,
+            )
 
             index_service.index_asset(entity)
             events.emit(
@@ -242,7 +247,7 @@ class AssetsCsvImportResource(BaseCsvProjectImportResource):
             )
 
         elif self.is_update:
-            entity.update(asset_new_values)
+            entity.update({**asset_values, **asset_new_values})
 
             index_service.remove_asset_index(entity.id)
             index_service.index_asset(entity)
@@ -276,8 +281,11 @@ class AssetsCsvImportResource(BaseCsvProjectImportResource):
             ]
         return task_type_ids
 
-    def run_import(self, project_id, file_path):
-        entities = super().run_import(project_id, file_path)
+    def run_import(self, file_path, project_id):
+        entities = super().run_import(
+            file_path,
+            project_id,
+        )
         for asset in entities:
             task_type_ids = self.get_task_types_for_asset_type(
                 asset["entity_type_id"]

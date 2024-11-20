@@ -4,12 +4,15 @@ from operator import itemgetter
 from zou.app.models.file_status import FileStatus
 from zou.app import app
 
-from zou.app.models.working_file import WorkingFile
+from zou.app.models.entity import Entity
 from zou.app.models.output_file import OutputFile
 from zou.app.models.output_type import OutputType
 from zou.app.models.preview_file import PreviewFile
+from zou.app.models.preview_background_file import PreviewBackgroundFile
 from zou.app.models.software import Software
 from zou.app.models.task import Task
+from zou.app.models.working_file import WorkingFile
+
 
 from zou.app.services import entities_service
 from zou.app.services.base_service import (
@@ -25,6 +28,7 @@ from zou.app.services.exception import (
     SoftwareNotFoundException,
     NoOutputFileException,
     EntryAlreadyExistsException,
+    PreviewBackgroundFileNotFoundException,
 )
 
 from zou.app.utils import cache, fields, events, query as query_utils
@@ -38,6 +42,30 @@ def clear_preview_file_cache(preview_file_id):
     cache.cache.delete_memoized(get_preview_file, preview_file_id)
 
 
+def clear_output_file_cache(output_file_id):
+    cache.cache.delete_memoized(get_output_file, output_file_id)
+
+
+def clear_working_file_cache(working_file_id):
+    cache.cache.delete_memoized(get_working_file, working_file_id)
+
+
+def clear_output_type_cache(output_type_id):
+    cache.cache.delete_memoized(get_output_type, output_type_id)
+
+
+def clear_software_cache(software_id):
+    cache.cache.delete_memoized(get_software, software_id)
+
+
+def clear_preview_background_file_cache(preview_background_file_id):
+    cache.cache.delete_memoized(
+        get_preview_background_file, preview_background_file_id
+    )
+    cache.cache.delete_memoized(get_preview_background_files)
+
+
+@cache.memoize_function(240)
 def get_default_status():
     """
     Return default file status to set on a file when it is created.
@@ -60,11 +88,12 @@ def get_working_file_raw(working_file_id):
     )
 
 
+@cache.memoize_function(240)
 def get_working_file(working_file_id):
     """
     Return given working file as dict.
     """
-    return get_working_file_raw(working_file_id).serialize()
+    return get_working_file_raw(working_file_id).serialize(relations=True)
 
 
 def get_output_file_raw(output_file_id):
@@ -76,6 +105,7 @@ def get_output_file_raw(output_file_id):
     )
 
 
+@cache.memoize_function(240)
 def get_output_file(output_file_id):
     """
     Return given output file as a dict.
@@ -90,6 +120,7 @@ def get_software_raw(software_id):
     return get_instance(Software, software_id, SoftwareNotFoundException)
 
 
+@cache.memoize_function(240)
 def get_software(software_id):
     """
     Return given software as dict.
@@ -106,6 +137,7 @@ def get_output_type_raw(output_type_id):
     )
 
 
+@cache.memoize_function(240)
 def get_output_type(output_type_id):
     """
     Return given output type as dict.
@@ -427,6 +459,42 @@ def get_last_output_revision(
     return output_files[0].serialize()
 
 
+def get_output_files_for_project(
+    project_id,
+    task_type_id=None,
+    output_type_id=None,
+    name=None,
+    representation=None,
+    file_status_id=None,
+):
+    """
+    Return output files for given project ordered by creation date.
+    """
+    query = OutputFile.query
+
+    if task_type_id:
+        query = query.filter(OutputFile.task_type_id == task_type_id)
+    if output_type_id:
+        query = query.filter(OutputFile.output_type_id == output_type_id)
+    if name:
+        query = query.filter(OutputFile.name == name)
+    if representation:
+        query = query.filter(OutputFile.representation == representation)
+    if file_status_id:
+        query = query.filter(OutputFile.file_status_id == file_status_id)
+
+    output_files = (
+        query.filter(OutputFile.asset_instance_id == None)
+        .filter(OutputFile.temporal_entity_id == None)
+        .filter(OutputFile.revision >= 0)
+        .filter(Entity.project_id == project_id)
+        .join(Entity, OutputFile.entity_id == Entity.id)
+        .order_by(desc(OutputFile.created_at))
+        .all()
+    )
+    return fields.serialize_models(output_files)
+
+
 def get_output_files_for_entity(
     entity_id,
     task_type_id=None,
@@ -740,12 +808,14 @@ def create_preview_file(
 def update_working_file(working_file_id, data):
     working_file = get_working_file_raw(working_file_id)
     working_file.update(data)
+    clear_working_file_cache(working_file_id)
     return working_file.serialize()
 
 
 def update_output_file(output_file_id, data):
     output_file = get_output_file_raw(output_file_id)
     output_file.update(data)
+    clear_output_file_cache(output_file_id)
     return output_file.serialize()
 
 
@@ -839,3 +909,58 @@ def get_preview_files_for_project(project_id, page=-1):
         .order_by(desc(PreviewFile.updated_at))
     )
     return query_utils.get_paginated_results(query, page)
+
+
+def get_preview_background_file_raw(preview_background_file_id):
+    """
+    Get preview background file matching given id as an active record.
+    """
+    try:
+        preview_background = PreviewBackgroundFile.get(
+            preview_background_file_id
+        )
+    except StatementError:
+        raise PreviewBackgroundFileNotFoundException
+
+    if preview_background is None:
+        raise PreviewBackgroundFileNotFoundException
+
+    return preview_background
+
+
+@cache.memoize_function(1200)
+def get_preview_background_file(preview_background_file_id):
+    """
+    Get preview background file matching given id as a dictionary.
+    """
+    return get_preview_background_file_raw(
+        preview_background_file_id
+    ).serialize()
+
+
+@cache.memoize_function(120)
+def get_preview_background_files():
+    """
+    Get all preview backgrounds files.
+    """
+    return fields.serialize_models(PreviewBackgroundFile.get_all())
+
+
+def reset_default_preview_background_files(preview_background_file_id):
+    """
+    Set all preview background files as is_default=False except the one matching given id.
+    """
+    PreviewBackgroundFile.query.filter(
+        PreviewBackgroundFile.id != preview_background_file_id,
+        PreviewBackgroundFile.is_default == True,
+    ).update({"is_default": False})
+    PreviewBackgroundFile.commit()
+
+
+def update_preview_background_file(preview_background_file_id, data):
+    preview_background_file = get_preview_background_file_raw(
+        preview_background_file_id
+    )
+    preview_background_file.update(data)
+    clear_preview_background_file_cache(preview_background_file_id)
+    return preview_background_file.serialize()

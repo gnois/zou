@@ -95,7 +95,9 @@ Vagrantfile
 /previews/
 /thumbnails/
 /indexes/
-release.sh
 
 tmp
 restore.sh
+
+# Meilisearch folder
+data.ms

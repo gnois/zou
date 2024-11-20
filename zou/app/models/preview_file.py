@@ -34,11 +34,16 @@ class PreviewFile(db.Model, BaseMixin, SerializerMixin):
     path = db.Column(db.String(400))
     source = db.Column(db.String(40))
     file_size = db.Column(db.BigInteger(), default=0)
-    status = db.Column(ChoiceType(STATUSES), default="processing")
+    status = db.Column(
+        ChoiceType(STATUSES), default="processing", nullable=False
+    )
     validation_status = db.Column(
-        ChoiceType(VALIDATION_STATUSES), default="neutral"
+        ChoiceType(VALIDATION_STATUSES), default="neutral", nullable=False
     )
     annotations = db.Column(JSONB)
+    width = db.Column(db.Integer(), default=0)
+    height = db.Column(db.Integer(), default=0)
+    duration = db.Column(db.Float, default=0)
 
     task_id = db.Column(
         UUIDType(binary=False), db.ForeignKey("task.id"), index=True

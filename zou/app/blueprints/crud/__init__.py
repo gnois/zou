@@ -76,6 +76,7 @@ from zou.app.blueprints.crud.project import (
     ProjectResource,
     ProjectsResource,
     ProjectTaskTypeLinksResource,
+    ProjectTaskStatusLinksResource,
 )
 from zou.app.blueprints.crud.project_status import (
     ProjectStatusResource,
@@ -92,6 +93,10 @@ from zou.app.blueprints.crud.subscription import (
 from zou.app.blueprints.crud.search_filter import (
     SearchFiltersResource,
     SearchFilterResource,
+)
+from zou.app.blueprints.crud.search_filter_group import (
+    SearchFilterGroupsResource,
+    SearchFilterGroupResource,
 )
 from zou.app.blueprints.crud.software import (
     SoftwaresResource,
@@ -114,7 +119,16 @@ from zou.app.blueprints.crud.working_file import (
     WorkingFilesResource,
     WorkingFileResource,
 )
-
+from zou.app.blueprints.crud.preview_background_file import (
+    PreviewBackgroundFileResource,
+    PreviewBackgroundFilesResource,
+)
+from zou.app.blueprints.crud.chat import ChatResource, ChatsResource
+from zou.app.blueprints.crud.chat_message import (
+    ChatMessageResource,
+    ChatMessagesResource,
+)
+from zou.app.blueprints.crud.studio import StudioResource, StudiosResource
 
 routes = [
     ("/data/persons", PersonsResource),
@@ -132,6 +146,7 @@ routes = [
     ("/data/task-type-links", ProjectTaskTypeLinksResource),
     ("/data/task-status", TaskStatusesResource),
     ("/data/task-status/<instance_id>", TaskStatusResource),
+    ("/data/task-status-links", ProjectTaskStatusLinksResource),
     ("/data/tasks", TasksResource),
     ("/data/tasks/<instance_id>", TaskResource),
     ("/data/departments", DepartmentsResource),
@@ -172,6 +187,8 @@ routes = [
     ("/data/notifications/<instance_id>", NotificationResource),
     ("/data/search-filters/", SearchFiltersResource),
     ("/data/search-filters/<instance_id>", SearchFilterResource),
+    ("/data/search-filter-groups/", SearchFilterGroupsResource),
+    ("/data/search-filter-groups/<instance_id>", SearchFilterGroupResource),
     ("/data/schedule-items/", ScheduleItemsResource),
     ("/data/schedule-items/<instance_id>", ScheduleItemResource),
     ("/data/news/", NewssResource),
@@ -184,6 +201,17 @@ routes = [
     ("/data/subscriptions/<instance_id>", SubscriptionResource),
     ("/data/entity-links/", EntityLinksResource),
     ("/data/entity-links/<instance_id>", EntityLinkResource),
+    ("/data/chats/", ChatsResource),
+    ("/data/chats/<instance_id>", ChatResource),
+    ("/data/chat-messages/", ChatMessagesResource),
+    ("/data/chat-messages/<instance_id>", ChatMessageResource),
+    ("/data/preview-background-files", PreviewBackgroundFilesResource),
+    (
+        "/data/preview-background-files/<instance_id>",
+        PreviewBackgroundFileResource,
+    ),
+    ("/data/studios", StudiosResource),
+    ("/data/studios/<instance_id>", StudioResource),
 ]
 
 blueprint = Blueprint("/data", "data")

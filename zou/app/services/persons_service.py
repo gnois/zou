@@ -8,7 +8,7 @@ from sqlalchemy.exc import StatementError
 
 from babel.dates import format_datetime
 
-from flask_jwt_extended import get_jwt_identity
+from flask_jwt_extended import create_access_token, get_jti, current_user
 
 from zou.app.models.department import Department
 from zou.app.models.desktop_login_log import DesktopLoginLog
@@ -16,15 +16,14 @@ from zou.app.models.organisation import Organisation
 from zou.app.models.person import Person
 from zou.app.models.time_spent import TimeSpent
 
-from zou.app import config
-from zou.app.utils import fields, events, cache, emails
+from zou.app import config, file_store
+from zou.app.utils import fields, events, cache, emails, date_helpers
 from zou.app.services import index_service, auth_service
-from zou.app.stores import file_store, auth_tokens_store
-
+from zou.app.stores import auth_tokens_store
 from zou.app.services.exception import (
-    DepartmentNotFoundException,
     PersonNotFoundException,
     PersonInProtectedAccounts,
+    WrongParameterException,
 )
 
 
@@ -32,9 +31,13 @@ def clear_person_cache():
     cache.cache.delete_memoized(get_person)
     cache.cache.delete_memoized(get_person_by_email)
     cache.cache.delete_memoized(get_person_by_desktop_login)
-    cache.cache.delete_memoized(get_person_by_email_dekstop_login)
+    cache.cache.delete_memoized(get_person_by_email_desktop_login)
     cache.cache.delete_memoized(get_active_persons)
     cache.cache.delete_memoized(get_persons)
+
+
+def clear_oranisation_cache():
+    cache.cache.delete_memoized(get_organisation)
 
 
 @cache.memoize_function(120)
@@ -44,10 +47,10 @@ def get_persons(minimal=False):
     """
     persons = []
     for person in Person.query.all():
-        if not minimal:
-            persons.append(person.serialize_safe(relations=True))
-        else:
+        if minimal:
             persons.append(person.present_minimal(relations=True))
+        else:
+            persons.append(person.serialize_safe(relations=True))
     return persons
 
 
@@ -61,7 +64,7 @@ def get_all_raw_active_persons():
 @cache.memoize_function(120)
 def get_active_persons():
     """
-    Return all person with flag active set to True.
+    Return all persons with flag active set to True.
     """
     persons = (
         Person.query.filter_by(active=True)
@@ -90,19 +93,22 @@ def get_person_raw(person_id):
 
 
 @cache.memoize_function(120)
-def get_person(person_id):
+def get_person(person_id, unsafe=False, relations=True):
     """
     Return given person as a dictionary.
     """
     person = get_person_raw(person_id)
-    return person.serialize_safe(relations=True)
+    if unsafe:
+        return person.serialize(relations=relations)
+    else:
+        return person.serialize_safe(relations=relations)
 
 
 def get_person_by_email_raw(email):
     """
     Return person that matches given email as an active record.
     """
-    person = Person.get_by(email=email)
+    person = Person.get_by(email=email, is_bot=False)
 
     if person is None:
         raise PersonNotFoundException()
@@ -128,13 +134,32 @@ def get_person_by_desktop_login(desktop_login):
     to authenticate user from their desktop session login.
     """
     try:
-        person = Person.get_by(desktop_login=desktop_login)
+        person = Person.get_by(desktop_login=desktop_login, is_bot=False)
     except StatementError:
         raise PersonNotFoundException()
 
     if person is None:
         raise PersonNotFoundException()
     return person.serialize()
+
+
+def get_current_user(unsafe=False, relations=False):
+    """
+    Return person from its auth token (the one that does the request) as a
+    dictionary.
+    """
+    if unsafe:
+        return current_user.serialize(relations=relations)
+    else:
+        return current_user.serialize_safe(relations=relations)
+
+
+def get_current_user_raw():
+    """
+    Return person from its auth token (the one that does the request) as an
+    active record.
+    """
+    return current_user
 
 
 def get_person_by_ldap_uid(ldap_uid):
@@ -144,7 +169,7 @@ def get_person_by_ldap_uid(ldap_uid):
     if ldap_uid is None:
         raise PersonNotFoundException()
     try:
-        person = Person.get_by(ldap_uid=ldap_uid)
+        person = Person.get_by(ldap_uid=ldap_uid, is_bot=False)
     except StatementError:
         raise PersonNotFoundException()
 
@@ -154,7 +179,7 @@ def get_person_by_ldap_uid(ldap_uid):
 
 
 @cache.memoize_function(120)
-def get_person_by_email_dekstop_login(email_or_desktop_login):
+def get_person_by_email_desktop_login(email_or_desktop_login):
     """
     Return person that matches given email or desktop login as a dictionary.
     """
@@ -162,24 +187,6 @@ def get_person_by_email_dekstop_login(email_or_desktop_login):
         return get_person_by_email(email_or_desktop_login, unsafe=True)
     except PersonNotFoundException:
         return get_person_by_desktop_login(email_or_desktop_login)
-
-
-def get_current_user(unsafe=False, relations=False):
-    """
-    Return person from its auth token (the one that does the request) as a
-    dictionary.
-    """
-    return get_person_by_email(
-        get_jwt_identity(), unsafe=unsafe, relations=relations
-    )
-
-
-def get_current_user_raw():
-    """
-    Return person from its auth token (the one that does the request) as an
-    active record.
-    """
-    return get_person_by_email_raw(get_jwt_identity())
 
 
 def get_persons_map():
@@ -201,6 +208,10 @@ def create_person(
     departments=[],
     is_generated_from_ldap=False,
     ldap_uid=None,
+    is_bot=False,
+    expiration_date=None,
+    studio_id=None,
+    active=True,
     serialize=True,
 ):
     """
@@ -209,17 +220,18 @@ def create_person(
     """
     if email is not None:
         email = email.strip()
-    if not departments:
-        departments = []
 
-    try:
-        departments_objects = [
-            Department.get(department_id)
-            for department_id in departments
-            if department_id is not None
-        ]
-    except StatementError:
-        raise DepartmentNotFoundException()
+    if expiration_date is not None:
+        try:
+            if (
+                date_helpers.get_date_from_string(expiration_date).date()
+                < datetime.date.today()
+            ):
+                raise WrongParameterException(
+                    "Expiration date can't be in the past."
+                )
+        except:
+            raise WrongParameterException("Expiration date is not valid.")
 
     person = Person.create(
         email=email,
@@ -229,14 +241,29 @@ def create_person(
         phone=phone,
         role=role,
         desktop_login=desktop_login,
-        departments=departments_objects,
+        departments=departments,
         is_generated_from_ldap=is_generated_from_ldap,
         ldap_uid=ldap_uid,
+        is_bot=is_bot,
+        expiration_date=expiration_date,
+        studio_id=studio_id,
+        active=active,
     )
+    if is_bot:
+        access_token = create_access_token_for_raw_person(person)
     index_service.index_person(person)
     events.emit("person:new", {"person_id": person.id})
     clear_person_cache()
-    return person.serialize(relations=True) if serialize else person
+    if serialize:
+        if is_bot:
+            return {
+                "access_token": access_token,
+                **person.serialize(relations=True),
+            }
+        else:
+            return person.serialize(relations=True)
+    else:
+        return person
 
 
 def update_password(email, password):
@@ -249,28 +276,59 @@ def update_password(email, password):
     return person.serialize()
 
 
-def update_person(person_id, data):
+def update_person(person_id, data, bypass_protected_accounts=False):
     """
     Update person entry with data given in parameter.
     """
     person = Person.get(person_id)
     if (
-        data.get("active") is False
+        not bypass_protected_accounts
         and person.email in config.PROTECTED_ACCOUNTS
     ):
-        raise PersonInProtectedAccounts(
-            "Can't set this person as inactive it's a protected account."
-        )
+        message = None
+        if data.get("active") is False:
+            message = (
+                "Can't set this person as inactive it's a protected account."
+            )
+        elif data.get("role") is not None:
+            message = "Can't change the role of this person it's a protected account."
+
+        if message is not None:
+            raise PersonInProtectedAccounts(message)
 
     if "email" in data and data["email"] is not None:
         data["email"] = data["email"].strip()
+
+    if "expiration_date" in data and data["expiration_date"] is not None:
+        try:
+            if (
+                datetime.datetime.strptime(
+                    data["expiration_date"], "%Y-%m-%d"
+                ).date()
+                < datetime.date.today()
+            ):
+                raise WrongParameterException(
+                    "Expiration date can't be in the past."
+                )
+        except:
+            raise WrongParameterException("Expiration date is not valid.")
+
     person.update(data)
+
+    if "expiration_date" in data:
+        access_token = create_access_token_for_raw_person(person)
     index_service.remove_person_index(person_id)
     if person.active:
         index_service.index_person(person)
     events.emit("person:update", {"person_id": person_id})
     clear_person_cache()
-    return person.serialize()
+    if "expiration_date" in data:
+        return {
+            "access_token": access_token,
+            **person.serialize(),
+        }
+    else:
+        return person.serialize()
 
 
 def delete_person(person_id):
@@ -323,7 +381,9 @@ def update_person_last_presence(person_id):
         date = log.date
     elif time_spent is not None:
         date = time_spent.date
-    return update_person(person_id, {"last_presence": date})
+    return update_person(
+        person_id, {"last_presence": date}, bypass_protected_accounts=True
+    )
 
 
 def get_presence_logs(year, month):
@@ -389,7 +449,7 @@ def invite_person(person_id):
     )
 
     time_string = format_datetime(
-        datetime.datetime.utcnow(),
+        date_helpers.get_utc_now_datetime(),
         tzinfo=person["timezone"],
         locale=person["locale"],
     )
@@ -419,6 +479,7 @@ Thank you and see you soon on Kitsu,
     emails.send_email(subject, html, person["email"])
 
 
+@cache.memoize_function(120)
 def get_organisation():
     """
     Return organisation set up on this instance. It creates it if none exists.
@@ -436,6 +497,7 @@ def update_organisation(organisation_id, data):
     organisation = Organisation.get(organisation_id)
     organisation.update(data)
     events.emit("organisation:update", {"organisation_id": organisation_id})
+    clear_oranisation_cache()
     return organisation.present()
 
 
@@ -444,7 +506,9 @@ def is_user_limit_reached():
     Returns true if the number of active users is equal and superior to the
     user limit set in the configuration.
     """
-    nb_active_users = Person.query.filter(Person.active).count()
+    nb_active_users = Person.query.filter(
+        Person.active, Person.is_bot.isnot(True)
+    ).count()
     return nb_active_users >= config.USER_LIMIT
 
 
@@ -454,8 +518,9 @@ def add_to_department(department_id, person_id):
     """
     person = get_person_raw(person_id)
     department = Department.get(department_id)
-    person.departments = person.departments + [department]
+    person.departments.append(department)
     person.save()
+    clear_person_cache()
     return person.serialize(relations=True)
 
 
@@ -470,6 +535,7 @@ def remove_from_department(department_id, person_id):
         if str(department.id) != department_id
     ]
     person.save()
+    clear_person_cache()
     return person.serialize(relations=True)
 
 
@@ -480,8 +546,41 @@ def clear_avatar(person_id):
     person = get_person_raw(person_id)
     person.update({"has_avatar": False})
     clear_person_cache()
-    try:
-        file_store.remove_picture("thumbnails", person_id)
-    except BaseException:
-        pass
+    if config.REMOVE_FILES:
+        try:
+            file_store.remove_picture("thumbnails", person_id)
+        except BaseException:
+            pass
     return person.serialize()
+
+
+def is_jti_revoked(jti):
+    """
+    Return True if the given token id is revoked.
+    """
+    return Person.query.filter_by(jti=jti).first() is None
+
+
+def create_access_token_for_raw_person(person):
+    """
+    Create an access token for the given raw person.
+    """
+    expires_delta = False
+    if person.expiration_date is not None:
+        expires_delta = (
+            datetime.datetime.combine(
+                person.expiration_date,
+                datetime.datetime.max.time(),
+            )
+            - date_helpers.get_utc_now_datetime()
+        )
+    access_token = create_access_token(
+        identity=person.id,
+        additional_claims={
+            "identity_type": "bot" if person.is_bot else "person_api",
+        },
+        expires_delta=expires_delta,
+    )
+    person.jti = get_jti(access_token)
+    person.save()
+    return access_token

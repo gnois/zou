@@ -7,7 +7,6 @@ from zou.app.blueprints.persons.resources import (
     DayOffForMonthResource,
     DesktopLoginsResource,
     InvitePersonResource,
-    NewPersonResource,
     PersonMonthQuotaShotsResource,
     PersonWeekQuotaShotsResource,
     PersonDayQuotaShotsResource,
@@ -17,6 +16,7 @@ from zou.app.blueprints.persons.resources import (
     PersonDayTimeSpentsResource,
     PersonWeekDayOffResource,
     PersonYearDayOffResource,
+    PersonDayOffResource,
     PersonMonthDayOffResource,
     PresenceLogsResource,
     TimeSpentsResource,
@@ -29,10 +29,10 @@ from zou.app.blueprints.persons.resources import (
     RemoveFromDepartmentResource,
     ChangePasswordForPersonResource,
     DisableTwoFactorAuthenticationPersonResource,
+    ClearAvatarPersonResource,
 )
 
 routes = [
-    ("/data/persons/new", NewPersonResource),
     ("/data/persons/<person_id>/desktop-login-logs", DesktopLoginsResource),
     ("/data/persons/presence-logs/<month_date>", PresenceLogsResource),
     ("/data/persons/<person_id>/time-spents", TimeSpentsResource),
@@ -90,6 +90,10 @@ routes = [
         "/data/persons/<person_id>/day-offs/year/<year>",
         PersonYearDayOffResource,
     ),
+    (
+        "/data/persons/<person_id>/day-offs",
+        PersonDayOffResource,
+    ),
     ("/actions/persons/<person_id>/invite", InvitePersonResource),
     ("/actions/persons/<person_id>/departments/add", AddToDepartmentResource),
     (
@@ -103,6 +107,10 @@ routes = [
     (
         "/actions/persons/<person_id>/disable-two-factor-authentication",
         DisableTwoFactorAuthenticationPersonResource,
+    ),
+    (
+        "/actions/persons/<person_id>/clear-avatar",
+        ClearAvatarPersonResource,
     ),
 ]
 

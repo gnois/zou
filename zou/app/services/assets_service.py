@@ -5,11 +5,16 @@ from sqlalchemy.orm import aliased
 from zou.app.utils import events, fields, cache
 from zou.app.utils import query as query_utils
 
-from zou.app.models.entity import Entity, EntityLink
+from zou.app.models.entity import (
+    Entity,
+    EntityLink,
+    EntityConceptLink,
+    EntityVersion,
+)
 from zou.app.models.entity_type import EntityType
+from zou.app.models.subscription import Subscription
 from zou.app.models.project import Project
 from zou.app.models.task import Task
-from zou.app.models.task_type import TaskType
 from zou.app.models.asset_instance import AssetInstance
 from zou.app.models.task import assignees_table
 
@@ -23,13 +28,13 @@ from zou.app.services import (
     shots_service,
     user_service,
     entities_service,
+    concepts_service,
 )
 
 from zou.app.services.exception import (
     AssetNotFoundException,
     AssetInstanceNotFoundException,
     AssetTypeNotFoundException,
-    TaskTypeNotFoundException,
 )
 
 
@@ -45,40 +50,20 @@ def clear_asset_type_cache():
 
 def get_temporal_type_ids():
     shot_type = shots_service.get_shot_type()
-    if shot_type is None:
-        cache.cache.delete_memoized(shots_service.get_shot_type)
-        shot_type = shots_service.get_shot_type()
-
     scene_type = shots_service.get_scene_type()
-    if scene_type is None:
-        cache.cache.delete_memoized(shots_service.get_scene_type)
-        scene_type = shots_service.get_scene_type()
-
     sequence_type = shots_service.get_sequence_type()
-    if sequence_type is None:
-        cache.cache.delete_memoized(shots_service.get_sequence_type)
-        sequence_type = shots_service.get_sequence_type()
-
     episode_type = shots_service.get_episode_type()
-    if episode_type is None:
-        cache.cache.delete_memoized(shots_service.get_episode_type)
-        episode_type = shots_service.get_episode_type()
-
     edit_type = edits_service.get_edit_type()
-    if edit_type is None:
-        cache.cache.delete_memoized(edits_service.get_edit_type)
-        edit_type = edits_service.get_edit_type()
+    concept_type = concepts_service.get_concept_type()
 
-    ids_to_exclude = [
+    return [
         shot_type["id"],
         sequence_type["id"],
         episode_type["id"],
         edit_type["id"],
+        scene_type["id"],
+        concept_type["id"],
     ]
-    if scene_type is not None:
-        ids_to_exclude.append(scene_type["id"])
-
-    return ids_to_exclude
 
 
 def build_asset_type_filter():
@@ -99,7 +84,7 @@ def build_entity_type_asset_type_filter():
     return ~EntityType.id.in_(ids_to_exclude)
 
 
-def get_assets(criterions={}):
+def get_assets(criterions={}, is_admin=False):
     """
     Get all assets for given criterions.
     """
@@ -116,6 +101,12 @@ def get_assets(criterions={}):
     if assigned_to:
         query = query.outerjoin(Task)
         query = query.filter(user_service.build_assignee_filter())
+
+    if "is_shared" in criterions:
+        if not is_admin:
+            query = query.join(Project).filter(
+                user_service.build_team_filter()
+            )
 
     if episode_id is not None:
         # Filter based on main episode.
@@ -136,7 +127,7 @@ def get_assets(criterions={}):
         result += [a for a in query.all() if a.source_id != episode_id]
     else:
         result = query.all()
-    return EntityType.serialize_list(result, obj_type="Asset")
+    return Entity.serialize_list(result, obj_type="Asset")
 
 
 def get_all_raw_assets():
@@ -209,7 +200,9 @@ def get_assets_and_tasks(criterions={}, page=1, with_episode_ids=False):
         Task.end_date,
         Task.start_date,
         Task.due_date,
+        Task.done_date,
         Task.last_comment_date,
+        Task.difficulty,
         assignees_table.columns.person,
     ).order_by(EntityType.name, Entity.name)
 
@@ -287,7 +280,9 @@ def get_assets_and_tasks(criterions={}, page=1, with_episode_ids=False):
         task_end_date,
         task_start_date,
         task_due_date,
+        task_done_date,
         task_last_comment_date,
+        task_difficulty,
         person_id,
     ) in query_result:
         if asset.source_id is None:
@@ -319,6 +314,7 @@ def get_assets_and_tasks(criterions={}, page=1, with_episode_ids=False):
                 "episode_id": source_id,
                 "casting_episode_ids": cast_in_episode_ids.get(asset_id, []),
                 "is_casting_standby": asset.is_casting_standby,
+                "is_shared": asset.is_shared,
                 "data": data,
                 "tasks": [],
             }
@@ -329,6 +325,7 @@ def get_assets_and_tasks(criterions={}, page=1, with_episode_ids=False):
                 task_dict = {
                     "id": task_id,
                     "due_date": fields.serialize_value(task_due_date),
+                    "done_date": fields.serialize_value(task_done_date),
                     "duration": task_duration,
                     "entity_id": asset_id,
                     "estimation": task_estimation,
@@ -343,6 +340,7 @@ def get_assets_and_tasks(criterions={}, page=1, with_episode_ids=False):
                     ),
                     "retake_count": task_retake_count,
                     "start_date": fields.serialize_value(task_start_date),
+                    "difficulty": task_difficulty,
                     "task_status_id": str(task_status_id),
                     "task_type_id": str(task_type_id),
                     "assignees": [],
@@ -431,26 +429,6 @@ def get_asset_with_relations(entity_id):
     Return a given asset as a dict.
     """
     return get_asset_raw(entity_id).serialize(obj_type="Asset", relations=True)
-
-
-def get_task_types_from_asset_type(data):
-    """
-    Return a list of task types objects from ids `task_types` list of data dict.
-
-    Args:
-        data (dict): Data from Resource POST
-    """
-    task_types = []
-    if "task_types" in data:
-        try:
-            for task_type_id in data["task_types"]:
-                task_type = TaskType.get(task_type_id)
-                if task_type is not None:
-                    task_types.append(task_type)
-        except StatementError:
-            raise TaskTypeNotFoundException()
-
-    return task_types
 
 
 def get_asset_by_shotgun_id(shotgun_id):
@@ -567,19 +545,7 @@ def is_asset(entity):
     """
     Returns true if given entity is an asset, not a shot.
     """
-    shot_type = shots_service.get_shot_type()
-    sequence_type = shots_service.get_sequence_type()
-    scene_type = shots_service.get_scene_type()
-    episode_type = shots_service.get_episode_type()
-    edit_type = edits_service.get_edit_type()
-
-    return str(entity.entity_type_id) not in [
-        shot_type["id"],
-        scene_type["id"],
-        sequence_type["id"],
-        episode_type["id"],
-        edit_type["id"],
-    ]
+    return str(entity.entity_type_id) not in get_temporal_type_ids()
 
 
 def is_asset_dict(entity):
@@ -587,36 +553,14 @@ def is_asset_dict(entity):
     Returns true if given entity is an asset, not a shot.
     It supposes that the entity is represented as a dict.
     """
-    shot_type = shots_service.get_shot_type()
-    sequence_type = shots_service.get_sequence_type()
-    scene_type = shots_service.get_scene_type()
-    episode_type = shots_service.get_episode_type()
-    edit_type = edits_service.get_edit_type()
-
-    return entity["entity_type_id"] not in [
-        shot_type["id"],
-        scene_type["id"],
-        sequence_type["id"],
-        episode_type["id"],
-        edit_type["id"],
-    ]
+    return entity["entity_type_id"] not in get_temporal_type_ids()
 
 
 def is_asset_type(entity_type):
     """
     Returns true if given entity type is an asset, not a shot.
     """
-    shot_type = shots_service.get_shot_type()
-    sequence_type = shots_service.get_sequence_type()
-    scene_type = shots_service.get_scene_type()
-    episode_type = shots_service.get_episode_type()
-
-    return str(entity_type.id) not in [
-        shot_type["id"],
-        sequence_type["id"],
-        scene_type["id"],
-        episode_type["id"],
-    ]
+    return str(entity_type.id) not in get_temporal_type_ids()
 
 
 def create_asset_types(asset_type_names):
@@ -632,7 +576,14 @@ def create_asset_types(asset_type_names):
 
 
 def create_asset(
-    project_id, asset_type_id, name, description, data, source_id=None
+    project_id,
+    asset_type_id,
+    name,
+    description,
+    data,
+    is_shared=False,
+    source_id=None,
+    created_by=None,
 ):
     """
     Create a new asset from given parameters.
@@ -647,7 +598,9 @@ def create_asset(
         name=name,
         description=description,
         data=data,
+        is_shared=is_shared,
         source_id=source_id,
+        created_by=created_by,
     )
 
     index_service.index_asset(asset)
@@ -703,6 +656,12 @@ def remove_asset(asset_id, force=False):
             {"asset_id": asset_id},
             project_id=str(asset.project_id),
         )
+        EntityVersion.delete_all_by(entity_id=asset_id)
+        Subscription.delete_all_by(entity_id=asset_id)
+        EntityLink.delete_all_by(entity_in_id=asset_id)
+        EntityLink.delete_all_by(entity_out_id=asset_id)
+        EntityConceptLink.delete_all_by(entity_in_id=asset_id)
+        EntityConceptLink.delete_all_by(entity_out_id=asset_id)
     deleted_asset = asset.serialize(obj_type="Asset")
     return deleted_asset
 
@@ -759,3 +718,69 @@ def cancel_asset(asset_id, force=True):
         project_id=str(asset.project_id),
     )
     return asset_dict
+
+
+def set_shared_assets(
+    is_shared=True,
+    project_id=None,
+    asset_type_id=None,
+    asset_ids=None,
+    with_events=False,
+):
+    """
+    Set all assets of a project to is_shared=True or False.
+    """
+
+    query = Entity.query.filter(build_asset_type_filter()).filter()
+
+    if project_id is not None:
+        query = query.filter(Entity.project_id == project_id)
+
+    if asset_type_id is not None:
+        query = query.filter(Entity.entity_type_id == asset_type_id)
+
+    if asset_ids is not None:
+        query = query.filter(Entity.id.in_(asset_ids))
+
+    assets = query.all()
+
+    for asset in assets:
+        asset.update_no_commit({"is_shared": is_shared})
+
+    Entity.commit()
+
+    for asset in assets:
+        asset_id = str(asset.id)
+        clear_asset_cache(asset_id)
+        if with_events:
+            events.emit(
+                "asset:update",
+                {"asset_id": asset_id},
+                project_id=project_id,
+            )
+
+    return Entity.serialize_list(assets, obj_type="Asset")
+
+
+def get_shared_assets_used_in_project(project_id, episode_id=None):
+    """
+    Get all shared assets used in a project.
+    """
+    Shot = aliased(Entity, name="shot")
+    Sequence = aliased(Entity, name="sequence")
+
+    assets = (
+        Entity.query.filter(build_asset_type_filter())
+        .filter(Entity.is_shared == True)
+        .join(EntityLink, EntityLink.entity_out_id == Entity.id)
+        .join(Shot, EntityLink.entity_in_id == Shot.id)
+        .join(Sequence, Shot.parent_id == Sequence.id)
+        .filter(Shot.project_id == project_id)
+        .filter(Entity.canceled != True)
+        .filter(Entity.project_id != project_id)
+    )
+
+    if episode_id is not None and episode_id not in ["main", "all"]:
+        assets = assets.filter(Sequence.parent_id == episode_id)
+
+    return Entity.serialize_list(assets.all(), obj_type="Asset")

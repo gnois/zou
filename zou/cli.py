@@ -1,8 +1,10 @@
 #!/usr/bin/env python
+
 import os
 import sys
 import flask_migrate
 import click
+import traceback
 
 from sqlalchemy.exc import IntegrityError
 
@@ -26,13 +28,39 @@ def cli():
 
 
 @cli.command()
+def version():
+    """
+    Return current installation version.
+    """
+    from zou import __version__
+
+    print(f"Zou version: {__version__}")
+
+
+@cli.command()
 def init_db():
-    "Creates datababase table (database must be created through PG client)."
+    "Create database table (database must be created through PG client)."
 
     print("Creating database and tables...")
     with app.app_context():
         flask_migrate.upgrade(directory=migrations_path)
     print("Database and tables created.")
+
+
+@cli.command()
+def is_db_ready():
+    """
+    Return a message telling whether the database is initialized or not.
+    """
+    with app.app_context():
+        is_init = dbhelpers.is_init()
+        if is_init:
+            print("Database is initialized.")
+        else:
+            print(
+                "Database is not initialized. "
+                "Run 'zou init-db' and 'zou init-data'."
+            )
 
 
 @cli.command()
@@ -47,7 +75,7 @@ def migrate_db(message):
 
 
 @cli.command()
-@click.option("--revision", default=None)
+@click.option("--revision", default="-1")
 def downgrade_db(revision):
     """
     Downgrade db to previous revision of the database schema
@@ -70,7 +98,7 @@ def clear_db():
 
 @cli.command()
 def reset_db():
-    "Drop all tables then recreates them."
+    "Drop all tables, then recreate them."
     with app.app_context():
         print("Deleting database and tables...")
         dbhelpers.drop_all()
@@ -81,10 +109,22 @@ def reset_db():
 
 
 @cli.command()
-def upgrade_db():
-    "Upgrade database schema."
+@click.option("--no-telemetry", is_flag=True, default=False)
+def upgrade_db(no_telemetry=False):
+    """
+    Upgrade database schema. Send anonymized statistics to our telemetry
+    services (user and preview amounts). It allows us to size the Kitsu
+    community.
+    """
     with app.app_context():
         flask_migrate.upgrade(directory=migrations_path)
+        if not no_telemetry and config.IS_SELF_HOSTED:
+            from zou.app.services import telemetry_services
+
+            try:
+                telemetry_services.send_main_infos()
+            except Exception:
+                traceback.print_exc()
 
 
 @cli.command()
@@ -116,7 +156,7 @@ def reset_migrations():
 
 @cli.command()
 @click.argument("email")
-@click.option("--password", required=True, default=None)
+@click.option("--password", default=None)
 def create_admin(email, password):
     """
     Create an admin user to allow usage of the API when database is empty.
@@ -125,10 +165,18 @@ def create_admin(email, password):
         try:
             person = persons_service.get_person_by_email(email)
             if person["role"] != "admin":
-                persons_service.update_person(person["id"], {"role": "admin"})
+                persons_service.update_person(
+                    person["id"],
+                    {"role": "admin"},
+                    bypass_protected_accounts=True,
+                )
                 print("Existing user's role has been upgraded to 'admin'.")
         except PersonNotFoundException:
             try:
+                if password is None:
+                    raise click.MissingParameter(
+                        param_type="option", param_hint="--password"
+                    )
                 auth.validate_password(password)
                 # Allow "admin@example.com" to be invalid.
                 if email != "admin@example.com":
@@ -168,19 +216,19 @@ def clear_all_auth_tokens():
 
 @cli.command()
 def init_data():
-    "Generates minimal data set required to run Kitsu."
+    "Generate minimal data set required to run Kitsu."
     commands.init_data()
 
 
 @cli.command()
-@click.argument("email_or_desktop_login")
+@click.argument("email-or-desktop-login")
 def disable_two_factor_authentication(email_or_desktop_login):
     """
     Disable two factor authentication for given user.
     """
     with app.app_context():
         try:
-            person_id = persons_service.get_person_by_email_dekstop_login(
+            person_id = persons_service.get_person_by_email_desktop_login(
                 email_or_desktop_login
             )
             auth_service.disable_two_factor_authentication_for_person(
@@ -201,7 +249,7 @@ def disable_two_factor_authentication(email_or_desktop_login):
 
 @cli.command()
 @click.argument("email")
-@click.option("--password", required=True, default=None)
+@click.option("--password", required=True)
 def change_password(email, password):
     """
     Change the password of given user.
@@ -257,28 +305,28 @@ def sync_with_ldap_server():
 
 
 @cli.command()
-@click.option("--target", default="http://localhost:5000")
+@click.option("--source", default="http://localhost:5000")
 @click.option("--project")
 @click.option("--no-projects", is_flag=True)
 @click.option("--with-events", is_flag=True)
 @click.option("--only-projects", is_flag=True)
 def sync_full(
-    target,
+    source,
     project=None,
     with_events=False,
     no_projects=False,
     only_projects=False,
 ):
     """
-    Retrieve all data from target instance. It expects that credentials to
-    connect to target instance are given through SYNC_LOGIN and SYNC_PASSWORD
+    Retrieve all data from source instance. It expects that credentials to
+    connect to source instance are given through SYNC_LOGIN and SYNC_PASSWORD
     environment variables.
     """
     print("Start syncing.")
     login = os.getenv("SYNC_LOGIN")
     password = os.getenv("SYNC_PASSWORD")
     commands.import_data_from_another_instance(
-        target,
+        source,
         login,
         password,
         project=project,
@@ -290,101 +338,116 @@ def sync_full(
 
 
 @cli.command()
-@click.option("--target", default="http://localhost:5000", show_default=True)
+@click.option("--source", default="http://localhost:5000", show_default=True)
+@click.option("--project", default=None, show_default=True)
 @click.option(
     "--multithreaded", is_flag=True, show_default=True, default=False
 )
-@click.option("--number_workers", default=30, show_default=True, type=int)
-@click.option("--number_attemps", default=3, show_default=True, type=int)
-@click.option("--project")
+@click.option("--number-workers", default=30, show_default=True, type=int)
+@click.option("--number-attemps", default=3, show_default=True, type=int)
+@click.option("--force-resync", is_flag=True, show_default=True, default=False)
 def sync_full_files(
-    target, multithreaded, number_workers, number_attemps, project=None
+    source,
+    project,
+    multithreaded,
+    number_workers,
+    number_attemps,
+    force_resync,
 ):
     """
-    Retrieve all files from target instance. It expects that credentials to
-    connect to target instance are given through SYNC_LOGIN and SYNC_PASSWORD
+    Retrieve all files from source instance. It expects that credentials to
+    connect to source instance are given through SYNC_LOGIN and SYNC_PASSWORD
     environment variables.
     """
     print("Start syncing.")
     login = os.getenv("SYNC_LOGIN")
     password = os.getenv("SYNC_PASSWORD")
-    commands.import_files_from_another_instance(
-        target,
+    dict_errors = commands.import_files_from_another_instance(
+        source,
         login,
         password,
         project=project,
         multithreaded=multithreaded,
         number_workers=number_workers,
         number_attemps=number_attemps,
+        force_resync=force_resync,
     )
     print("Syncing ended.")
+    if dict_errors:
+        print("Errors summary:")
+        for prefix, value in dict_errors.items():
+            print(f"{prefix}:")
+            for id, error in value.items():
+                print(f"{id}:\n{error}")
+            print()
+        sys.exit(1)
 
 
 @cli.command()
-@click.option("--event-target", default="http://localhost:8080")
-@click.option("--target", default="http://localhost:8080/api")
+@click.option("--event-source", default="http://localhost:8080")
+@click.option("--source", default="http://localhost:8080/api")
 @click.option("--logs-directory", default=None)
-def sync_changes(event_target, target, logs_directory):
+def sync_changes(event_source, source, logs_directory):
     """
-    Run a daemon that import data related to any change happening on target
-    instance. It expects that credentials to connect to target instance are
+    Run a daemon that import data related to any change happening on source
+    instance. It expects that credentials to connect to source instance are
     given through SYNC_LOGIN and SYNC_PASSWORD environment variables.
     """
     login = os.getenv("SYNC_LOGIN")
     password = os.getenv("SYNC_PASSWORD")
     commands.run_sync_change_daemon(
-        event_target, target, login, password, logs_directory
+        event_source, source, login, password, logs_directory
     )
 
 
 @cli.command()
-@click.option("--event-target", default="http://localhost:8080")
-@click.option("--target", default="http://localhost:8080/api")
+@click.option("--event-source", default="http://localhost:8080")
+@click.option("--source", default="http://localhost:8080/api")
 @click.option("--logs-directory", default=None)
-def sync_file_changes(event_target, target, logs_directory):
+def sync_file_changes(event_source, source, logs_directory):
     """
-    Run a daemon that download files related to any change happening on target
-    instance. It expects that credentials to connect to target instance are
+    Run a daemon that download files related to any change happening on source
+    instance. It expects that credentials to connect to source instance are
     given through SYNC_LOGIN and SYNC_PASSWORD environment variables.
     """
     login = os.getenv("SYNC_LOGIN")
     password = os.getenv("SYNC_PASSWORD")
     commands.run_sync_file_change_daemon(
-        event_target, target, login, password, logs_directory
+        event_source, source, login, password, logs_directory
     )
 
 
 @cli.command()
-@click.option("--target", default="http://localhost:8080/api")
+@click.option("--source", default="http://localhost:8080/api")
 @click.option("--minutes", default=0)
 @click.option("--page-size", default=300)
-def sync_last_events(target, minutes, page_size):
+def sync_last_events(source, minutes, page_size):
     """
-    Retrieve last events that occured on target instance and import data related
-    to them. It expects that credentials to connect to target instance are
+    Retrieve last events that occured on source instance and import data related
+    to them. It expects that credentials to connect to source instance are
     given through SYNC_LOGIN and SYNC_PASSWORD environment variables.
     """
     login = os.getenv("SYNC_LOGIN")
     password = os.getenv("SYNC_PASSWORD")
     commands.import_last_changes_from_another_instance(
-        target, login, password, minutes=minutes, page_size=page_size
+        source, login, password, minutes=minutes, page_size=page_size
     )
 
 
 @cli.command()
-@click.option("--target", default="http://localhost:8080/api")
+@click.option("--source", default="http://localhost:8080/api")
 @click.option("--minutes", default=20)
 @click.option("--page-size", default=50)
-def sync_last_files(target, minutes, page_size):
+def sync_last_files(source, minutes, page_size):
     """
-    Retrieve last preview files and thumbnails updloaded on target instance.
-    It expects that credentials to connect to target instance are
+    Retrieve last preview files and thumbnails uploaded on source instance.
+    It expects that credentials to connect to source instance are
     given through SYNC_LOGIN and SYNC_PASSWORD environment variables.
     """
     login = os.getenv("SYNC_LOGIN")
     password = os.getenv("SYNC_PASSWORD")
     commands.import_last_file_changes_from_another_instance(
-        target, login, password, minutes=minutes, page_size=page_size
+        source, login, password, minutes=minutes, page_size=page_size
     )
 
 
@@ -417,13 +480,13 @@ def upload_files_to_cloud_storage(days):
 
 
 @cli.command()
-@click.option("--projectid")
-def clean_tasks_data(projectid):
+@click.option("--project-id")
+def clean_tasks_data(project_id):
     """
     Reset task models data (retake count, wip start date and end date)
     """
-    if projectid is not None:
-        commands.reset_tasks_data(projectid)
+    if project_id is not None:
+        commands.reset_tasks_data(project_id)
 
 
 @cli.command()
@@ -431,7 +494,7 @@ def clean_tasks_data(projectid):
 def remove_old_data(days):
     """
     Remove old events, notifications and login logs older than 90 days
-    (by deafult).
+    (by default).
     """
     commands.remove_old_data(days)
 
@@ -457,6 +520,135 @@ def init_search_index():
 def search_asset(query):
     """ """
     commands.search_asset(query)
+
+
+@cli.command()
+@click.option("--project", default=None, show_default=True)
+@click.option("--entity-id", default=None, show_default=True)
+@click.option("--episode", default=None, show_default=True, multiple=True)
+@click.option("--only-shots", is_flag=True, default=False, show_default=True)
+@click.option("--only-assets", is_flag=True, default=False, show_default=True)
+@click.option("--with-tiles", is_flag=True, default=False, show_default=True)
+@click.option(
+    "--with-metadata", is_flag=True, default=False, show_default=True
+)
+@click.option(
+    "--with-thumbnails", is_flag=True, default=False, show_default=True
+)
+@click.option(
+    "--force-regenerate-tiles", is_flag=True, default=False, show_default=True
+)
+def generate_preview_extra(
+    project,
+    entity_id,
+    episode,
+    only_shots,
+    only_assets,
+    with_tiles,
+    with_metadata,
+    with_thumbnails,
+    force_regenerate_tiles,
+):
+    """
+    Generate tiles, thumbnails and metadata for all previews.
+    """
+    commands.generate_preview_extra(
+        project=project,
+        entity_id=entity_id,
+        episodes=episode,
+        only_shots=only_shots,
+        only_assets=only_assets,
+        force_regenerate_tiles=force_regenerate_tiles,
+        with_tiles=with_tiles,
+        with_metadata=with_metadata,
+        with_thumbnails=with_thumbnails,
+    )
+
+
+@cli.command()
+def reset_movie_files_metadata():
+    """
+    Store height and width metadata for all movie previews in the database.
+    """
+    commands.reset_movie_files_metadata()
+
+
+@cli.command()
+def reset_picture_files_metadata():
+    """
+    Store height and width metadata for all picture previews in the database.
+    """
+    commands.reset_picture_files_metadata()
+
+
+@cli.command()
+def reset_breakdown_data():
+    """
+    Reset breakdown statistics for all open projects.
+    """
+    commands.reset_breakdown_data()
+
+
+@cli.command()
+@click.option("--email", required=True)
+@click.option("--name", required=True)
+@click.option(
+    "--expiration-date",
+    required=False,
+    default=None,
+    show_default=True,
+    help="Format: YYYY-MM-DD",
+)
+@click.option("--role", required=False, default="user", show_default=True)
+def create_bot(
+    email,
+    name,
+    expiration_date,
+    role,
+):
+    """
+    Create a bot.
+    """
+    commands.create_bot(
+        email,
+        name,
+        expiration_date,
+        role,
+    )
+
+
+@cli.command()
+@click.option(
+    "--preview-file-id",
+    required=False,
+    default=None,
+    show_default=True,
+)
+@click.option(
+    "--project-id",
+    required=False,
+    default=None,
+    show_default=True,
+)
+@click.option("--all-broken", is_flag=True, default=False, show_default=True)
+@click.option(
+    "--all-processing", is_flag=True, default=False, show_default=True
+)
+def renormalize_movie_preview_files(
+    preview_file_id,
+    project_id,
+    all_broken,
+    all_processing,
+):
+    """
+    Renormalize all preview files.
+    """
+    commands.renormalize_movie_preview_files(
+        preview_file_id,
+        project_id,
+        all_broken,
+        all_processing,
+    )
 
 
 if __name__ == "__main__":

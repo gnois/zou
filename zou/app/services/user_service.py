@@ -1,5 +1,5 @@
 from sqlalchemy.orm import aliased
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from zou.app import config
 from zou.app.models.comment import Comment
@@ -9,7 +9,9 @@ from zou.app.models.notification import Notification
 from zou.app.models.person import Person
 from zou.app.models.project import Project
 from zou.app.models.project_status import ProjectStatus
+from zou.app.models.subscription import Subscription
 from zou.app.models.search_filter import SearchFilter
+from zou.app.models.search_filter_group import SearchFilterGroup
 from zou.app.models.task import Task
 from zou.app.models.task_type import TaskType
 
@@ -25,16 +27,29 @@ from zou.app.services import (
     shots_service,
     status_automations_service,
     tasks_service,
+    files_service,
 )
 from zou.app.services.exception import (
     SearchFilterNotFoundException,
+    SearchFilterGroupNotFoundException,
     NotificationNotFoundException,
+    WrongParameterException,
 )
 from zou.app.utils import cache, fields, permissions
 
 
-def clear_filter_cache(user_id):
-    cache.cache.delete_memoized(get_user_filters, user_id)
+def clear_filter_cache(user_id=None):
+    if user_id is None:
+        cache.cache.delete_memoized(get_user_filters)
+    else:
+        cache.cache.delete_memoized(get_user_filters, user_id)
+
+
+def clear_filter_group_cache(user_id=None):
+    if user_id is None:
+        cache.cache.delete_memoized(get_user_filter_groups)
+    else:
+        cache.cache.delete_memoized(get_user_filter_groups, user_id)
 
 
 def clear_project_cache():
@@ -120,11 +135,20 @@ def get_tasks_to_check():
     """
     Get all tasks waiting for feedback in the user department.
     """
-    current_user = persons_service.get_current_user(relations=True)
-    projects = related_projects()
-    project_ids = [project["id"] for project in projects]
+    departments_ids = None
+    if permissions.has_admin_permissions():
+        project_ids = None
+    elif permissions.has_manager_permissions():
+        project_ids = [project["id"] for project in related_projects()]
+    elif permissions.has_supervisor_permissions():
+        current_user = persons_service.get_current_user(relations=True)
+        departments_ids = current_user["departments"]
+        project_ids = [project["id"] for project in related_projects()]
+    else:
+        return []
+
     return tasks_service.get_person_tasks_to_check(
-        current_user["departments"], project_ids
+        project_ids, departments_ids
     )
 
 
@@ -388,21 +412,25 @@ def check_belong_to_project(project_id):
 
     project = projects_service.get_project_with_relations(str(project_id))
     current_user = persons_service.get_current_user()
-    if current_user["id"] in project["team"]:
-        return True
-    else:
-        return False
+    return current_user["id"] in project["team"]
+
+
+def has_project_access(project_id):
+    """
+    Return true if current user is a manager or has a task assigned for this
+    project.
+    """
+    return permissions.has_admin_permissions() or check_belong_to_project(
+        project_id
+    )
 
 
 def check_project_access(project_id):
     """
     Return true if current user is a manager or has a task assigned for this
-    project.
+    project. Raise a PermissionDenied exception if not.
     """
-    is_allowed = (
-        permissions.has_admin_permissions()
-        or check_belong_to_project(project_id)
-    )
+    is_allowed = has_project_access(project_id)
     if not is_allowed:
         raise permissions.PermissionDenied
     return is_allowed
@@ -433,6 +461,21 @@ def check_entity_access(entity_id):
             raise permissions.PermissionDenied
         is_allowed = True
     return is_allowed
+
+
+def check_task_status_access(task_status_id):
+    """
+    Return true if current user can use this task status.
+    """
+    is_artist = permissions.has_artist_permissions()
+    is_client = permissions.has_client_permissions()
+    if is_artist or is_client:
+        task_status = tasks_service.get_task_status(task_status_id)
+        if is_artist and not task_status["is_artist_allowed"]:
+            raise permissions.PermissionDenied
+        if is_client and not task_status["is_client_allowed"]:
+            raise permissions.PermissionDenied
+    return True
 
 
 def check_comment_access(comment_id):
@@ -473,15 +516,45 @@ def check_comment_access(comment_id):
         return True
 
 
-def check_manager_project_access(project_id):
+def has_manager_project_access(project_id):
     """
     Return true if current user is a manager and has a task assigned for this
     project.
     """
-    is_allowed = permissions.has_admin_permissions() or (
+    return permissions.has_admin_permissions() or (
         permissions.has_manager_permissions()
         and check_belong_to_project(project_id)
     )
+
+
+def check_manager_project_access(project_id):
+    """
+    Return true if current user is a manager and has a task assigned for this
+    project. Raise a PermissionDenied exception if not.
+    """
+    is_allowed = has_manager_project_access(project_id)
+    if not is_allowed:
+        raise permissions.PermissionDenied
+    return is_allowed
+
+
+def check_time_spent_access(task_id, person_id):
+    """
+    Return true if current user is an admin or is a manager or is assigned to
+    the task.
+    """
+    task = tasks_service.get_task(task_id, relations=True)
+    is_allowed = person_id in task["assignees"] and (
+        persons_service.get_current_user()["id"] == person_id
+        or (
+            permissions.has_admin_permissions()
+            or (
+                permissions.has_manager_permissions()
+                and check_belong_to_project(task["project_id"])
+            )
+        )
+    )
+
     if not is_allowed:
         raise permissions.PermissionDenied
     return is_allowed
@@ -582,7 +655,10 @@ def check_metadata_department_access(entity, new_data={}):
     """
     is_allowed = False
     if permissions.has_admin_permissions() or (
-        permissions.has_manager_permissions()
+        (
+            permissions.has_manager_permissions()
+            or entity["created_by"] == persons_service.get_current_user()["id"]
+        )
         and check_belong_to_project(entity["project_id"])
     ):
         is_allowed = True
@@ -639,7 +715,7 @@ def check_metadata_department_access(entity, new_data={}):
     return is_allowed
 
 
-def check_task_departement_access(task_id, person_id):
+def check_task_department_access(task_id, person_id):
     """
     Return true if current user is an admin or is a manager and is in team
     or is a supervisor in the department of the task or is an artist assigning
@@ -681,7 +757,17 @@ def check_task_departement_access(task_id, person_id):
     return is_allowed
 
 
-def check_task_departement_access_for_unassign(task_id, person_id=None):
+def check_person_is_not_bot(person_id):
+    """
+    Return true if person is not a bot else raise PermissionDenied
+    """
+    if persons_service.get_person(person_id)["is_bot"]:
+        raise permissions.PermissionDenied
+    else:
+        return True
+
+
+def check_task_department_access_for_unassign(task_id, person_id=None):
     """
     Return true if current user is an admin or is a manager and is in team
     or is a supervisor in the department of the task or is an artist assigning
@@ -789,43 +875,86 @@ def get_user_filters(current_user_id):
     result = {}
 
     filters = (
-        SearchFilter.query.join(Project)
-        .join(ProjectStatus)
-        .filter(SearchFilter.person_id == current_user_id)
-        .filter(build_open_project_filter())
+        SearchFilter.query.outerjoin(Project)
+        .outerjoin(ProjectStatus)
+        .filter(
+            or_(
+                SearchFilter.person_id == current_user_id,
+                SearchFilter.is_shared == True,
+            )
+        )
+        .filter(
+            or_(build_open_project_filter(), SearchFilter.project_id == None)
+        )
         .all()
     )
 
-    filters = (
-        filters
-        + SearchFilter.query.filter(SearchFilter.person_id == current_user_id)
-        .filter(SearchFilter.project_id == None)
-        .all()
-    )
+    current_user = persons_service.get_current_user(relations=True)
+    is_manager = permissions.has_manager_permissions()
 
     for search_filter in filters:
-        if search_filter.list_type not in result:
-            result[search_filter.list_type] = {}
-        subresult = result[search_filter.list_type]
+        department_id = search_filter.department_id
+        is_in_departments = (
+            department_id is not None
+            and str(department_id) in current_user["departments"]
+        )
 
-        if search_filter.project_id is None:
-            project_id = "all"
-        else:
-            project_id = str(search_filter.project_id)
+        if department_id is None or is_manager or is_in_departments:
+            if search_filter.list_type not in result:
+                result[search_filter.list_type] = {}
+            subresult = result[search_filter.list_type]
 
-        if project_id not in subresult:
-            subresult[project_id] = []
+            if search_filter.project_id is None:
+                project_id = "all"
+            else:
+                project_id = str(search_filter.project_id)
 
-        subresult[project_id].append(search_filter.serialize())
+            if project_id not in subresult:
+                subresult[project_id] = []
+
+            subresult[project_id].append(search_filter.serialize())
 
     return result
 
 
-def create_filter(list_type, name, query, project_id=None, entity_type=None):
+def create_filter(
+    list_type,
+    name,
+    query,
+    project_id=None,
+    entity_type=None,
+    is_shared=False,
+    search_filter_group_id=None,
+    department_id=None,
+):
     """
     Add a new search filter to the database.
     """
     current_user = persons_service.get_current_user()
+
+    if project_id is None or (
+        project_id is not None and not has_manager_project_access(project_id)
+    ):
+        is_shared = False
+
+    if search_filter_group_id is not None:
+        search_filter_group = SearchFilterGroup.get_by(
+            id=search_filter_group_id
+        )
+        if search_filter_group is None:
+            raise SearchFilterGroupNotFoundException
+        if is_shared != search_filter_group.is_shared:
+            raise WrongParameterException(
+                "A search filter should have the same value for is_shared than its search filter group."
+            )
+
+    if department_id is not None:
+        department = tasks_service.get_department(department_id)
+        if department is None:
+            raise WrongParameterException(
+                f"No department found with id: {department_id}"
+            )
+
     search_filter = SearchFilter.create(
         list_type=list_type,
         name=name,
@@ -833,9 +962,15 @@ def create_filter(list_type, name, query, project_id=None, entity_type=None):
         project_id=project_id,
         person_id=current_user["id"],
         entity_type=entity_type,
+        is_shared=is_shared,
+        search_filter_group_id=search_filter_group_id,
+        department_id=department_id,
     )
     search_filter.serialize()
-    clear_filter_cache(current_user["id"])
+    if search_filter.is_shared:
+        clear_filter_cache()
+    else:
+        clear_filter_cache(current_user["id"])
     return search_filter.serialize()
 
 
@@ -847,10 +982,64 @@ def update_filter(search_filter_id, data):
     search_filter = SearchFilter.get_by(
         id=search_filter_id, person_id=current_user["id"]
     )
+    if current_user["role"] == "admin" and search_filter is None:
+        search_filter = SearchFilter.get_by(id=search_filter_id)
+
     if search_filter is None:
         raise SearchFilterNotFoundException
+
+    department_id = data.get("department_id", None)
+    if department_id is not None:
+        department = tasks_service.get_department(department_id)
+        if department is None:
+            raise WrongParameterException(
+                f"No department found with id: {department_id}"
+            )
+
+    if (
+        data.get("is_shared", None) is not None
+        and search_filter.is_shared != data["is_shared"]
+        and (
+            data.get("project_id", None) is None
+            or (
+                data["project_id"] is not None
+                and not has_manager_project_access(data["project_id"])
+            )
+        )
+    ):
+        data["is_shared"] = False
+
+    if (
+        search_filter_group_id := data.get(
+            "search_filter_group_id", search_filter.search_filter_group_id
+        )
+    ) is not None:
+        search_filter_group = SearchFilterGroup.get_by(
+            id=search_filter_group_id
+        )
+        if search_filter_group is None:
+            raise SearchFilterGroupNotFoundException
+        if (
+            data.get("is_shared", search_filter.is_shared)
+            != search_filter_group.is_shared
+        ):
+            raise WrongParameterException(
+                "A search filter should have the same value for is_shared than its search filter group."
+            )
+
+    department_id = data.get("department_id", None)
+    if department_id is not None:
+        department = tasks_service.get_department(department_id)
+        if department is None:
+            raise WrongParameterException(
+                f"No department found with id: {department_id}"
+            )
+
     search_filter.update(data)
-    clear_filter_cache(current_user["id"])
+    if search_filter.is_shared:
+        clear_filter_cache()
+    else:
+        clear_filter_cache(current_user["id"])
     return search_filter.serialize()
 
 
@@ -865,8 +1054,207 @@ def remove_filter(search_filter_id):
     if search_filter is None:
         raise SearchFilterNotFoundException
     search_filter.delete()
-    clear_filter_cache(current_user["id"])
+    if search_filter.is_shared:
+        clear_filter_cache()
+    else:
+        clear_filter_cache(current_user["id"])
     return search_filter.serialize()
+
+
+def get_filter_groups():
+    """
+    Retrieve search filter groups used by current user. It groups them by
+    list type and project_id. If the filter group is not related to a project,
+    the project_id is all.
+    """
+    current_user = persons_service.get_current_user()
+    return get_user_filter_groups(current_user["id"])
+
+
+@cache.memoize_function(10)
+def get_user_filter_groups(current_user_id):
+    """
+    Retrieve search filter groups used for given user. It groups them by
+    list type and project_id. If the filter group is not related to a project,
+    the project_id is all.
+    """
+
+    result = {}
+
+    filter_groups = (
+        SearchFilterGroup.query.outerjoin(
+            Project, Project.id == SearchFilterGroup.project_id
+        )
+        .outerjoin(
+            ProjectStatus, ProjectStatus.id == Project.project_status_id
+        )
+        .filter(
+            or_(
+                SearchFilterGroup.person_id == current_user_id,
+                SearchFilterGroup.is_shared == True,
+            )
+        )
+        .filter(or_(build_open_project_filter(), Project.id == None))
+        .all()
+    )
+
+    current_user = persons_service.get_current_user(relations=True)
+    is_manager = permissions.has_manager_permissions()
+
+    for search_filter_group in filter_groups:
+        if search_filter_group.list_type not in result:
+            result[search_filter_group.list_type] = {}
+
+        department_id = search_filter_group.department_id
+        is_in_departments = (
+            department_id is not None
+            and str(department_id) in current_user["departments"]
+        )
+        if department_id is None or is_manager or is_in_departments:
+            subresult = result[search_filter_group.list_type]
+
+            if search_filter_group.project_id is None:
+                project_id = "all"
+            else:
+                project_id = str(search_filter_group.project_id)
+
+            if project_id not in subresult:
+                subresult[project_id] = []
+            subresult[project_id].append(search_filter_group.serialize())
+
+    return result
+
+
+def create_filter_group(
+    list_type,
+    name,
+    color,
+    project_id=None,
+    entity_type=None,
+    is_shared=False,
+    department_id=None,
+):
+    """
+    Add a new search filter group to the database.
+    """
+    current_user = persons_service.get_current_user()
+    if project_id is None or (
+        project_id is not None and not has_manager_project_access(project_id)
+    ):
+        is_shared = False
+
+    if department_id is not None:
+        department = tasks_service.get_department(department_id)
+        if department is None:
+            raise WrongParameterException(
+                f"No department found with id: {department_id}"
+            )
+
+    search_filter_group = SearchFilterGroup.create(
+        list_type=list_type,
+        name=name,
+        color=color,
+        project_id=project_id,
+        person_id=current_user["id"],
+        entity_type=entity_type,
+        is_shared=is_shared,
+        department_id=department_id,
+    )
+    search_filter_group.serialize()
+
+    if search_filter_group.is_shared:
+        clear_filter_group_cache()
+    else:
+        clear_filter_group_cache(current_user["id"])
+
+    return search_filter_group.serialize()
+
+
+def get_filter_group(search_filter_group_id):
+    """
+    Get given filter group from the database.
+    """
+    current_user = persons_service.get_current_user()
+    search_filter_group = SearchFilterGroup.get_by(
+        id=search_filter_group_id, person_id=current_user["id"]
+    )
+    if search_filter_group is None:
+        raise SearchFilterGroupNotFoundException
+    return search_filter_group.serialize()
+
+
+def update_filter_group(search_filter_group_id, data):
+    """
+    Update given filter group from database.
+    """
+    current_user = persons_service.get_current_user()
+    search_filter_group = SearchFilterGroup.get_by(
+        id=search_filter_group_id, person_id=current_user["id"]
+    )
+
+    if search_filter_group is None:
+        raise SearchFilterGroupNotFoundException
+
+    if (
+        data.get("is_shared", None) is not None
+        and search_filter_group.is_shared != data["is_shared"]
+        and (
+            data.get("project_id", None) is None
+            or (
+                data["project_id"] is not None
+                and not has_manager_project_access(data["project_id"])
+            )
+        )
+    ):
+        data["is_shared"] = False
+
+    search_filter_group.update(data)
+
+    if (
+        data.get("is_shared", None) is not None
+        and data.get("project_id", None) is not None
+        and has_manager_project_access(data["project_id"])
+    ):
+        if (
+            SearchFilter.query.filter_by(
+                search_filter_group_id=search_filter_group_id
+            ).update({"is_shared": data["is_shared"]})
+            > 0
+        ):
+            SearchFilter.query.session.commit()
+            clear_filter_cache()
+
+    if search_filter_group.is_shared:
+        clear_filter_group_cache()
+    else:
+        clear_filter_group_cache(current_user["id"])
+    return search_filter_group.serialize()
+
+
+def remove_filter_group(search_filter_group_id):
+    """
+    Remove given filter group from database.
+    """
+    current_user = persons_service.get_current_user()
+    search_filter_group = SearchFilterGroup.get_by(
+        id=search_filter_group_id, person_id=current_user["id"]
+    )
+    if search_filter_group is None:
+        raise SearchFilterGroupNotFoundException
+    if (
+        SearchFilter.query.filter_by(
+            search_filter_group_id=search_filter_group_id
+        ).delete()
+        > 0
+    ):
+        SearchFilter.query.session.commit()
+        clear_filter_cache()
+    search_filter_group.delete()
+    if search_filter_group.is_shared:
+        clear_filter_group_cache()
+    else:
+        clear_filter_group_cache(current_user["id"])
+    return search_filter_group.serialize()
 
 
 def get_notification(notification_id):
@@ -881,6 +1269,18 @@ def get_notification(notification_id):
     return notifications[0]
 
 
+def update_notification(notification_id, read):
+    """
+    Update read status of given notification.
+    """
+    current_user = persons_service.get_current_user()
+    notification = Notification.get_by(
+        id=notification_id, person_id=current_user["id"]
+    )
+    notification.update({"read": read})
+    return notification.serialize()
+
+
 def get_unread_notifications_count(notification_id=None):
     """
     Return the number of unread notifications.
@@ -891,6 +1291,9 @@ def get_unread_notifications_count(notification_id=None):
     ).count()
 
 
+from sqlalchemy import and_, func
+
+
 def get_last_notifications(
     notification_id=None,
     after=None,
@@ -898,6 +1301,8 @@ def get_last_notifications(
     task_type_id=None,
     task_status_id=None,
     notification_type=None,
+    read=None,
+    watching=None,
 ):
     """
     Return last 100 user notifications.
@@ -912,6 +1317,13 @@ def get_last_notifications(
         .join(Author, Author.id == Notification.author_id)
         .join(Task, Task.id == Notification.task_id)
         .join(Project, Project.id == Task.project_id)
+        .outerjoin(
+            Subscription,
+            and_(
+                Subscription.task_id == Task.id,
+                Subscription.person_id == current_user["id"],
+            ),
+        )
         .outerjoin(Comment, Comment.id == Notification.comment_id)
         .add_columns(
             Project.id,
@@ -922,6 +1334,7 @@ def get_last_notifications(
             Comment.text,
             Comment.replies,
             Task.entity_id,
+            Subscription.id,
             Author.role,
         )
     )
@@ -950,6 +1363,15 @@ def get_last_notifications(
     if notification_type is not None:
         query = query.filter(Notification.type == notification_type)
 
+    if read is not None:
+        query = query.filter(Notification.read == read)
+
+    if watching is not None:
+        if watching:
+            query = query.filter(Subscription.id != None)
+        else:
+            query = query.filter(Subscription.id == None)
+
     notifications = query.limit(100).all()
 
     for (
@@ -962,10 +1384,11 @@ def get_last_notifications(
         comment_text,
         comment_replies,
         task_entity_id,
+        subscription_id,
         role,
     ) in notifications:
-        (full_entity_name, episode_id) = names_service.get_full_entity_name(
-            task_entity_id
+        (full_entity_name, episode_id, entity_preview_file_id) = (
+            names_service.get_full_entity_name(task_entity_id)
         )
         preview_file_id = None
         mentions = []
@@ -1025,6 +1448,8 @@ def get_last_notifications(
                     "change": notification.change,
                     "full_entity_name": full_entity_name,
                     "episode_id": episode_id,
+                    "entity_preview_file_id": entity_preview_file_id,
+                    "subscription_id": subscription_id,
                 }
             )
         )
@@ -1037,17 +1462,21 @@ def mark_notifications_as_read():
     Mark all recent notifications for current_user as read. It is useful
     to mark a list of notifications as read after an user retrieved them.
     """
+    from sqlalchemy import update
+    from zou.app import db
+
     current_user = persons_service.get_current_user()
-    notifications = (
-        Notification.query.filter_by(person_id=current_user["id"], read=False)
-        .order_by(Notification.created_at)
-        .all()
+    update_stmt = (
+        update(Notification)
+        .where(Notification.person_id == current_user["id"])
+        .where(Notification.read == False)
+        .values(read=True)
     )
 
-    for notification in notifications:
-        notification.update({"read": True})
+    db.session.execute(update_stmt)
+    db.session.commit()
 
-    return fields.serialize_list(notifications)
+    return True
 
 
 def has_task_subscription(task_id):
@@ -1144,15 +1573,19 @@ def get_context():
     notification_count = get_unread_notifications_count()
     project_status_list = projects_service.get_project_statuses()
     departments = tasks_service.get_departments()
+    studios = tasks_service.get_studios()
     task_types = tasks_service.get_task_types()
     task_status_list = tasks_service.get_task_statuses()
     search_filters = get_filters()
+    search_filter_groups = get_filter_groups()
+    preview_background_files = files_service.get_preview_background_files()
 
     return {
         "asset_types": asset_types,
         "custom_actions": custom_actions,
         "status_automations": status_automations,
         "departments": departments,
+        "studios": studios,
         "notification_count": notification_count,
         "persons": persons,
         "project_status": project_status_list,
@@ -1160,4 +1593,6 @@ def get_context():
         "task_types": task_types,
         "task_status": task_status_list,
         "search_filters": search_filters,
+        "search_filter_groups": search_filter_groups,
+        "preview_background_files": preview_background_files,
     }

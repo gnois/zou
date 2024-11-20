@@ -2,7 +2,6 @@ import os
 
 from tests.base import ApiDBTestCase
 
-from zou.app.utils import events
 
 from zou.app.services import projects_service, tasks_service
 
@@ -34,16 +33,6 @@ class RouteTaskChangeTestCase(ApiDBTestCase):
         self.wip_status_id = str(self.task_status_wip.id)
         self.retake_status_id = str(self.task_status_retake.id)
         self.done_status_id = str(self.task_status_done.id)
-
-        self.is_event_fired = False
-        events.unregister_all()
-
-    def handle_event(self, data):
-        self.is_event_fired = True
-        self.assertEqual(data["previous_task_status_id"], self.open_status_id)
-
-    def assert_event_is_fired(self):
-        self.assertTrue(self.is_event_fired)
 
     def test_retake_count(self):
         task_id = str(self.task.id)
@@ -93,7 +82,7 @@ class RouteTaskChangeTestCase(ApiDBTestCase):
             400,
         )
         self.put("/data/entities/%s" % asset_id, {"data": {"max_retakes": 2}})
-        entity = self.get("/data/entities/%s" % asset_id)
+        self.get("/data/entities/%s" % asset_id)
         self.post(
             "/actions/tasks/%s/comment" % task_id,
             {"task_status_id": self.retake_status_id, "comment": "retake 2"},

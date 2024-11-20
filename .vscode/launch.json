@@ -3,14 +3,15 @@
   "configurations": [
     {
       "name": "Python: Flask",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "module": "flask",
       "env": {
         "FLASK_APP": "zou.app",
         "FLASK_DEBUG": "1",
         "DEBUG": "1",
-        "MAIL_DEBUG": "1"
+        "MAIL_DEBUG_BODY": "1",
+        "MAIL_ENABLED": "False"
       },
       "args": ["run", "--no-reload"],
       "jinja": true,
@@ -18,11 +19,11 @@
     },
     {
       "name": "Python: Current File",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "program": "${file}",
       "console": "integratedTerminal",
-      "cwd": "${fileDirname}",
+      "cwd": "${workspaceFolder}",
       "env": {
         "PYTHONPATH": "${workspaceFolder}${pathSeparator}${env:PYTHONPATH}"
       },
@@ -30,7 +31,7 @@
     },
     {
       "name": "Python: Test current File",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "module": "pytest",
       "args": ["${file}"],
@@ -40,7 +41,7 @@
     },
     {
       "name": "Python: Real Time",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/zou/event_stream.py",
       "console": "integratedTerminal",

@@ -45,7 +45,9 @@ class PersonTestCase(ApiDBTestCase):
 
     def test_get_person(self):
         person = self.get_first("data/persons")
-        person_again = self.get("data/persons/%s" % person["id"])
+        person_again = self.get(
+            "data/persons/%s?relations=false" % person["id"]
+        )
         self.assertEqual(person, person_again)
         person_with_relations = self.get(
             "data/persons/%s?relations=true" % person["id"]
@@ -57,9 +59,9 @@ class PersonTestCase(ApiDBTestCase):
         data = {
             "first_name": "John2",
             "last_name": "Doe",
-            "email": "john2.doe@gmail.com",
+            "email": "john3.doe@gmail.com",
         }
-        self.person = self.post("data/persons/new", data)
+        self.person = self.post("data/persons", data)
         self.assertIsNotNone(self.person["id"])
 
         persons = self.get("data/persons")
@@ -74,13 +76,13 @@ class PersonTestCase(ApiDBTestCase):
             "last_name": "Doe",
             "email": "john3.doe@gmail.com",
         }
-        resp = self.post("data/persons/new", data, 400)
+        resp = self.post("data/persons", data, 400)
         self.assertEqual(resp["limit"], 4)
         config.USER_LIMIT = 100
 
     def test_create_person_with_no_data(self):
         data = {}
-        self.person = self.post("data/persons/new", data, 400)
+        self.person = self.post("data/persons", data, 400)
 
     def test_create_person_with_wrong_data(self):
         data = {
@@ -88,7 +90,7 @@ class PersonTestCase(ApiDBTestCase):
             "first_name": "John",
             "last_name": "Doe",
         }
-        self.person = self.post("data/persons/new", data, 400)
+        self.person = self.post("data/persons", data, 400)
 
     def test_create_person_with_departments(self):
         self.generate_fixture_department()
@@ -101,7 +103,8 @@ class PersonTestCase(ApiDBTestCase):
             "email": "john2.doe@gmail.com",
             "departments": departments,
         }
-        person = self.post("data/persons/new", data)
+
+        person = self.post("data/persons", data)
         self.assertIsNotNone(person["id"])
         self.assertEqual(
             set(person["departments"]),
@@ -172,7 +175,7 @@ class PersonTestCase(ApiDBTestCase):
         persons = self.get("data/persons")
         self.assertEqual(len(persons), 3)
 
-    def test_force_delete(self):
+    def test_cant_delete(self):
         self.generate_fixture_task_status_todo()
         self.generate_shot_suite()
         self.generate_assigned_task()
@@ -180,5 +183,13 @@ class PersonTestCase(ApiDBTestCase):
         self.person_id = str(self.person.id)
         self.get("data/persons/%s" % self.person_id)
         self.delete("data/persons/%s" % self.person_id, 400)
+
+    def test_force_delete(self):
+        self.generate_fixture_task_status_todo()
+        self.generate_shot_suite()
+        self.generate_assigned_task()
+        self.generate_fixture_comment()
+        self.person_id = str(self.person.id)
+        self.get("data/persons/%s" % self.person_id)
         self.delete("data/persons/%s?force=true" % self.person_id)
         self.get("data/persons/%s" % self.person_id, 404)

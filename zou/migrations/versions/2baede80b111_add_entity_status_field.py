@@ -5,11 +5,10 @@ Revises: 956659992419
 Create Date: 2023-01-24 19:09:55.648115
 
 """
+
 from alembic import op
 import sqlalchemy as sa
 import sqlalchemy_utils
-
-from zou.app.models.entity import ENTITY_STATUSES
 
 # revision identifiers, used by Alembic.
 
@@ -17,6 +16,13 @@ revision = "2baede80b111"
 down_revision = "956659992419"
 branch_labels = None
 depends_on = None
+
+ENTITY_STATUSES = [
+    ("standby", "Stand By"),
+    ("running", "Running"),
+    ("complete", "Complete"),
+    ("canceled", "Canceled"),
+]
 
 
 def upgrade():

@@ -1,7 +1,7 @@
 from flask_restful import reqparse
 from flask import request
 
-from zou.app.utils import fields
+from zou.app.utils import date_helpers
 from zou.app.services.exception import WrongParameterException
 
 
@@ -14,6 +14,7 @@ class ArgsMixin(object):
         parser = reqparse.RequestParser()
         if location is None:
             location = ["values", "json"] if request.is_json else ["values"]
+
         for descriptor in descriptors:
             action = None
             data_type = str
@@ -56,21 +57,28 @@ class ArgsMixin(object):
 
         return parser.parse_args()
 
-    def clear_empty_fields(self, data):
+    def clear_empty_fields(self, data, ignored_fields=[]):
         """
         Remove fields set to None from data dict.
         """
         for key in list(data.keys()):
-            if data[key] is None:
+            if key not in ignored_fields and data[key] is None:
                 del data[key]
         return data
 
     def get_page(self):
         """
-        Returns page requested by the user.
+        Returns page requested by the user as an integer.
         """
         options = request.args
         return int(options.get("page", "-1"))
+
+    def get_limit(self):
+        """
+        Returns limit requested by the user as an integer.
+        """
+        options = request.args
+        return int(options.get("limit", "-1"))
 
     def get_sort_by(self):
         """
@@ -114,15 +122,24 @@ class ArgsMixin(object):
         """
         return self.get_bool_parameter("no_job")
 
-    def get_text_parameter(self, field_name):
+    def get_text_parameter(self, field_name, default=None):
+        """
+        Returns text parameter value matching `field_name`.
+        """
         options = request.args
-        return options.get(field_name, None)
+        return options.get(field_name, default)
 
     def get_bool_parameter(self, field_name, default="false"):
+        """
+        Returns bool parameter value matching `field_name`.
+        """
         options = request.args
         return options.get(field_name, default).lower() == "true"
 
     def get_date_parameter(self, field_name):
+        """
+        Returns date parameter value matching `field_name`.
+        """
         self.parse_date_parameter(self.get_text_parameter(field_name))
 
     def parse_date_parameter(self, param):
@@ -130,10 +147,10 @@ class ArgsMixin(object):
         if param is None:
             return date
         try:
-            date = fields.get_date_object(param, "%Y-%m-%dT%H:%M:%S")
+            date = date_helpers.get_datetime_from_string(param)
         except Exception:
             try:
-                date = fields.get_date_object(param, "%Y-%m-%d")
+                date = date_helpers.get_date_from_string(param)
             except Exception:
                 raise WrongParameterException(
                     "Wrong date format for before argument."

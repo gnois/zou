@@ -18,6 +18,10 @@ from zou.app.services import (
 
 from zou.app.mixin import ArgsMixin
 from zou.app.utils import fields, query, permissions
+from zou.app.services.exception import (
+    WrongParameterException,
+    WrongParameterException,
+)
 
 
 class ShotResource(Resource, ArgsMixin):
@@ -48,6 +52,52 @@ class ShotResource(Resource, ArgsMixin):
         return shot
 
     @jwt_required()
+    def put(self, shot_id):
+        """
+        Update given shot.
+        ---
+        tags:
+        - Shots
+        parameters:
+          - in: path
+            name: shot_id
+            required: True
+            type: string
+            format: UUID
+            x-example: a24a6ea4-ce75-4665-a070-57453082c25
+          - in: body
+            name: data
+            required: True
+            type: object
+        responses:
+            200:
+                description: Update given shot
+        """
+        shot = shots_service.get_shot(shot_id)
+        user_service.check_manager_project_access(shot["project_id"])
+        data = request.json
+        if data is None:
+            raise WrongParameterException(
+                "Data are empty. Please verify that you sent JSON data and"
+                " that you set the right headers."
+            )
+        for field in [
+            "id",
+            "created_at",
+            "updated_at",
+            "instance_casting",
+            "project_id",
+            "entities_in",
+            "entities_out",
+            "type",
+            "shotgun_id",
+            "created_by",
+        ]:
+            data.pop(field, None)
+
+        return shots_service.update_shot(shot_id, data)
+
+    @jwt_required()
     def delete(self, shot_id):
         """
         Delete given shot.
@@ -67,7 +117,10 @@ class ShotResource(Resource, ArgsMixin):
         """
         force = self.get_force()
         shot = shots_service.get_shot(shot_id)
-        user_service.check_manager_project_access(shot["project_id"])
+        if shot["created_by"] == persons_service.get_current_user()["id"]:
+            user_service.check_belong_to_project(shot["project_id"])
+        else:
+            user_service.check_manager_project_access(shot["project_id"])
         shots_service.remove_shot(shot_id, force=force)
         return "", 204
 
@@ -115,7 +168,10 @@ class SceneResource(Resource):
                 description: Given scene deleted
         """
         scene = shots_service.get_scene(scene_id)
-        user_service.check_manager_project_access(scene["project_id"])
+        if scene["created_by"] == persons_service.get_current_user()["id"]:
+            user_service.check_belong_to_project(scene["project_id"])
+        else:
+            user_service.check_manager_project_access(scene["project_id"])
         shots_service.remove_scene(scene_id)
         return "", 204
 
@@ -693,6 +749,7 @@ class ProjectShotsResource(Resource, ArgsMixin):
             data=data,
             nb_frames=nb_frames,
             description=description,
+            created_by=persons_service.get_current_user()["id"],
         )
         return shot, 201
 
@@ -778,6 +835,7 @@ class ProjectSequencesResource(Resource, ArgsMixin):
             name,
             description=description,
             data=data,
+            created_by=persons_service.get_current_user()["id"],
         )
         return sequence, 201
 
@@ -857,7 +915,12 @@ class ProjectEpisodesResource(Resource, ArgsMixin):
         user_service.check_manager_project_access(project_id)
         return (
             shots_service.create_episode(
-                project_id, name, status, description, data
+                project_id,
+                name,
+                status,
+                description,
+                data,
+                created_by=persons_service.get_current_user()["id"],
             ),
             201,
         )
@@ -970,7 +1033,10 @@ class EpisodeResource(Resource, ArgsMixin):
         """
         force = self.get_force()
         episode = shots_service.get_episode(episode_id)
-        user_service.check_manager_project_access(episode["project_id"])
+        if episode["created_by"] == persons_service.get_current_user()["id"]:
+            user_service.check_belong_to_project(episode["project_id"])
+        else:
+            user_service.check_manager_project_access(episode["project_id"])
         deletion_service.remove_episode(episode_id, force=force)
         return "", 204
 
@@ -1131,7 +1197,10 @@ class SequenceResource(Resource, ArgsMixin):
         """
         force = self.get_force()
         sequence = shots_service.get_sequence(sequence_id)
-        user_service.check_manager_project_access(sequence["project_id"])
+        if sequence["created_by"] != persons_service.get_current_user()["id"]:
+            user_service.check_belong_to_project(sequence["project_id"])
+        else:
+            user_service.check_manager_project_access(sequence["project_id"])
         shots_service.remove_sequence(sequence_id, force=force)
         return "", 204
 
@@ -1258,7 +1327,12 @@ class ProjectScenesResource(Resource, ArgsMixin):
         (sequence_id, name) = self.get_arguments()
         projects_service.get_project(project_id)
         user_service.check_manager_project_access(project_id)
-        scene = shots_service.create_scene(project_id, sequence_id, name)
+        scene = shots_service.create_scene(
+            project_id,
+            sequence_id,
+            name,
+            created_by=persons_service.get_current_user()["id"],
+        )
         return scene, 201
 
     def get_arguments(self):
@@ -1482,19 +1556,100 @@ class ProjectQuotasResource(Resource, ArgsMixin):
             type: string
             format: UUID
             x-example: a24a6ea4-ce75-4665-a070-57453082c25
+          - in: query
+            name: count_mode
+            required: True
+            type: string
+            enum: [weighted, weigtheddone, feedback, done]
+            x-example: weighted
+          - in: query
+            name: studio_id
+            required: False
+            type: string
+            format: UUID
+            x-example: a24a6ea4-ce75-4665-a070-57453082c25
         responses:
             200:
                 description: Quotas statistics for shots
         """
         projects_service.get_project(project_id)
         user_service.check_project_access(project_id)
-        detail_level = self.get_text_parameter("detail")
-        weighted = self.get_bool_parameter("weighted", default="true")
+        args = self.get_args(
+            [
+                ("count_mode", "weighted", False, str),
+                ("studio_id", None, False, str),
+            ]
+        )
+        count_mode = args["count_mode"]
+        studio_id = args["studio_id"]
+
+        if count_mode not in ["weighted", "weighteddone", "feedback", "done"]:
+            raise WrongParameterException(
+                "count_mode must be equal to weighted, weigtheddone, feedback"
+                ", or done"
+            )
+
+        feedback = "done" not in count_mode
+        weighted = "weighted" in count_mode
+
         if weighted:
             return shots_service.get_weighted_quotas(
-                project_id, task_type_id, detail_level
+                project_id,
+                task_type_id,
+                feedback=feedback,
+                studio_id=studio_id,
             )
         else:
             return shots_service.get_raw_quotas(
-                project_id, task_type_id, detail_level
+                project_id,
+                task_type_id,
+                feedback=feedback,
+                studio_id=studio_id,
             )
+
+
+class SetShotsFramesResource(Resource, ArgsMixin):
+    @jwt_required()
+    def post(self, project_id, task_type_id):
+        """
+        Set frames for given shots.
+        ---
+        tags:
+        - Shots
+        parameters:
+          - in: formData
+            name: shots
+            required: True
+            type: array
+            items:
+              type: object
+              properties:
+                shot_id:
+                  type: string
+                  format: UUID
+                  x-example: a24a6ea4-ce75-4665-a070-57453082c25
+                nb_frames:
+                  type: integer
+                  x-example: 24
+        responses:
+            200:
+                description: Frames set for given shots
+        """
+        user_service.check_manager_project_access(project_id)
+        if not fields.is_valid_id(task_type_id) or not fields.is_valid_id(
+            project_id
+        ):
+            raise WrongParameterException("Invalid project or task type id")
+
+        episode_id = self.get_episode_id()
+        if not episode_id in ["", None] and not fields.is_valid_id(episode_id):
+            raise WrongParameterException("Invalid episode id")
+
+        if episode_id == "":
+            episode_id = None
+
+        return shots_service.set_frames_from_task_type_preview_files(
+            project_id,
+            task_type_id,
+            episode_id=episode_id,
+        )

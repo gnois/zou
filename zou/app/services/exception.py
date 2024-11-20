@@ -1,4 +1,4 @@
-from werkzeug.exceptions import NotFound, Forbidden
+from werkzeug.exceptions import NotFound, Forbidden, BadRequest, Unauthorized
 
 
 class EpisodeNotFoundException(NotFound):
@@ -10,6 +10,10 @@ class SequenceNotFoundException(NotFound):
 
 
 class ShotNotFoundException(NotFound):
+    pass
+
+
+class ConceptNotFoundException(NotFound):
     pass
 
 
@@ -37,7 +41,15 @@ class TaskNotFoundException(NotFound):
     pass
 
 
+class PreviewBackgroundFileNotFoundException(NotFound):
+    pass
+
+
 class DepartmentNotFoundException(NotFound):
+    pass
+
+
+class StudioNotFoundException(NotFound):
     pass
 
 
@@ -49,11 +61,15 @@ class TaskTypeNotFoundException(NotFound):
     pass
 
 
+class PersonInProtectedAccounts(Forbidden):
+    pass
+
+
 class PersonNotFoundException(NotFound):
     pass
 
 
-class PersonInProtectedAccounts(Forbidden):
+class TimeSpentNotFoundException(NotFound):
     pass
 
 
@@ -78,6 +94,10 @@ class OutputTypeNotFoundException(NotFound):
 
 
 class PreviewFileNotFoundException(NotFound):
+    pass
+
+
+class PreviewFileReuploadNotAllowedException(BadRequest):
     pass
 
 
@@ -110,6 +130,10 @@ class PlaylistNotFoundException(NotFound):
 
 
 class SearchFilterNotFoundException(NotFound):
+    pass
+
+
+class SearchFilterGroupNotFoundException(NotFound):
     pass
 
 
@@ -215,7 +239,7 @@ class UserCantConnectDueToNoFallback(Exception):
     pass
 
 
-class UnactiveUserException(Exception):
+class UnactiveUserException(Unauthorized):
     pass
 
 
@@ -227,15 +251,13 @@ class EntryAlreadyExistsException(Exception):
     pass
 
 
-class ArgumentsException(Exception):
-    pass
+class WrongParameterException(Exception):
+    def __init__(self, message, dict=None):
+        super().__init__(message)
+        self.dict = dict
 
 
 class WrongIdFormatException(Exception):
-    pass
-
-
-class WrongParameterException(Exception):
     pass
 
 

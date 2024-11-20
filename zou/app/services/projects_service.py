@@ -1,13 +1,15 @@
 import slugify
 
+from zou.app.models.preview_background_file import PreviewBackgroundFile
 from zou.app.models.entity import Entity
 from zou.app.models.entity_type import EntityType
 from zou.app.models.metadata_descriptor import MetadataDescriptor
-from zou.app.models.person import Person, department_link
+from zou.app.models.person import Person, DepartmentLink
 from zou.app.models.project import (
     Project,
     ProjectPersonLink,
     ProjectTaskTypeLink,
+    ProjectTaskStatusLink,
 )
 from zou.app.models.project_status import ProjectStatus
 from zou.app.models.status_automation import StatusAutomation
@@ -113,6 +115,18 @@ def get_projects_with_extra_data(
         project_dict["task_types_priority"] = {
             str(task_type_link.task_type_id): task_type_link.priority
             for task_type_link in ProjectTaskTypeLink.query.filter_by(
+                project_id=project.id
+            )
+        }
+
+        project_dict["task_statuses_link"] = {
+            str(task_status_link.task_status_id): {
+                "priority": task_status_link.priority,
+                "roles_for_board": fields.serialize_list(
+                    task_status_link.roles_for_board
+                ),
+            }
+            for task_status_link in ProjectTaskStatusLink.query.filter_by(
                 project_id=project.id
             )
         }
@@ -385,6 +399,34 @@ def remove_status_automation_setting(project_id, status_automation_id):
     )
 
 
+def add_preview_background_file_setting(
+    project_id, preview_background_file_id
+):
+    """
+    Add a preview background file listed in database to the project backgrounds.
+    """
+    return _add_to_list_attr(
+        project_id,
+        PreviewBackgroundFile,
+        preview_background_file_id,
+        "preview_background_files",
+    )
+
+
+def remove_preview_background_file_setting(
+    project_id, preview_background_file_id
+):
+    """
+    Remove a preview background file listed in database from the project backgrounds.
+    """
+    return _remove_from_list_attr(
+        project_id,
+        PreviewBackgroundFile,
+        preview_background_file_id,
+        "preview_background_files",
+    )
+
+
 def _add_to_list_attr(project_id, model_class, model_id, list_attr):
     project = get_project_raw(project_id)
     model = model_class.get(model_id)
@@ -444,7 +486,7 @@ def add_metadata_descriptor(
             departments=departments_objects,
             field_name=slugify.slugify(name, separator="_"),
         )
-    except Exception as e:
+    except Exception:
         raise WrongParameterException
     events.emit(
         "metadata-descriptor:new",
@@ -595,6 +637,31 @@ def create_project_task_type_link(project_id, task_type_id, priority):
     return task_type_link.serialize()
 
 
+def create_project_task_status_link(
+    project_id, task_status_id, priority, roles_for_board=[]
+):
+    task_status_link = ProjectTaskStatusLink.get_by(
+        project_id=project_id, task_status_id=task_status_id
+    )
+
+    if priority is not None:
+        priority = int(priority)
+
+    if task_status_link is None:
+        task_status_link = ProjectTaskStatusLink.create(
+            project_id=project_id,
+            task_status_id=task_status_id,
+            priority=priority,
+            roles_for_board=roles_for_board,
+        )
+    else:
+        task_status_link.update(
+            {"priority": priority, "roles_for_board": roles_for_board}
+        )
+
+    return task_status_link.serialize()
+
+
 def get_project_task_types(project_id):
     project = get_project_raw(project_id)
     return Project.serialize_list(project.task_types)
@@ -608,6 +675,11 @@ def get_project_task_statuses(project_id):
 def get_project_status_automations(project_id):
     project = get_project_raw(project_id)
     return Project.serialize_list(project.status_automations)
+
+
+def get_project_preview_background_files(project_id):
+    project = get_project_raw(project_id)
+    return Project.serialize_list(project.preview_background_files)
 
 
 def get_project_fps(project_id):
@@ -638,8 +710,8 @@ def get_department_team(project_id, department_id):
         Person.query.join(
             ProjectPersonLink, ProjectPersonLink.person_id == Person.id
         )
-        .join(department_link, department_link.columns.person_id == Person.id)
+        .join(DepartmentLink, DepartmentLink.person_id == Person.id)
         .filter(ProjectPersonLink.project_id == project_id)
-        .filter(department_link.columns.department_id == department_id)
+        .filter(DepartmentLink.department_id == department_id)
     ).all()
     return persons

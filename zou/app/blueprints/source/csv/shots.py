@@ -6,7 +6,12 @@ from zou.app.blueprints.source.csv.base import (
 from zou.app.models.entity import Entity
 from zou.app.models.project import ProjectTaskTypeLink
 from zou.app.models.task_type import TaskType
-from zou.app.services import shots_service, projects_service, index_service
+from zou.app.services import (
+    shots_service,
+    projects_service,
+    index_service,
+    persons_service,
+)
 from zou.app.services.tasks_service import (
     create_task,
     create_tasks,
@@ -15,13 +20,12 @@ from zou.app.services.tasks_service import (
     get_task_type,
 )
 from zou.app.services.comments_service import create_comment
-from zou.app.services.persons_service import get_current_user
 from zou.app.services.exception import WrongParameterException
 from zou.app.utils import events
 
 
 class ShotsCsvImportResource(BaseCsvProjectImportResource):
-    def post(self, project_id, **kwargs):
+    def post(self, project_id):
         """
         Import project shots via a .csv file.
         ---
@@ -46,7 +50,7 @@ class ShotsCsvImportResource(BaseCsvProjectImportResource):
             400:
                 description: The .csv file is not properly formatted.
         """
-        return super().post(project_id, **kwargs)
+        return super().post(project_id)
 
     def prepare_import(self, project_id):
         self.episodes = {}
@@ -66,7 +70,7 @@ class ShotsCsvImportResource(BaseCsvProjectImportResource):
             status["id"]: [status[n].lower() for n in ("name", "short_name")]
             for status in get_task_statuses()
         }
-        self.current_user_id = get_current_user()["id"]
+        self.current_user_id = persons_service.get_current_user()["id"]
 
     def get_tasks_update(self, row):
         tasks_update = []
@@ -152,10 +156,11 @@ class ShotsCsvImportResource(BaseCsvProjectImportResource):
         if self.is_tv_show:
             episode_key = "%s-%s" % (project_id, episode_name)
             if episode_key not in self.episodes:
-                self.episodes[
-                    episode_key
-                ] = shots_service.get_or_create_episode(
-                    project_id, episode_name, "running"
+                self.episodes[episode_key] = shots_service.create_episode(
+                    project_id,
+                    episode_name,
+                    "running",
+                    created_by=self.current_user_id,
                 )
 
             sequence_key = "%s-%s-%s" % (
@@ -169,16 +174,18 @@ class ShotsCsvImportResource(BaseCsvProjectImportResource):
         if sequence_key not in self.sequences:
             if self.is_tv_show:
                 episode = self.episodes[episode_key]
-                self.sequences[
-                    sequence_key
-                ] = shots_service.get_or_create_sequence(
-                    project_id, episode["id"], sequence_name
+                self.sequences[sequence_key] = shots_service.create_sequence(
+                    project_id,
+                    episode["id"],
+                    sequence_name,
+                    created_by=self.current_user_id,
                 )
             else:
-                self.sequences[
-                    sequence_key
-                ] = shots_service.get_or_create_sequence(
-                    project_id, None, sequence_name
+                self.sequences[sequence_key] = shots_service.create_sequence(
+                    project_id,
+                    None,
+                    sequence_name,
+                    created_by=self.current_user_id,
                 )
         sequence_id = self.get_id_from_cache(self.sequences, sequence_key)
 
@@ -229,7 +236,10 @@ class ShotsCsvImportResource(BaseCsvProjectImportResource):
         tasks_update = self.get_tasks_update(row)
 
         if entity is None:
-            entity = Entity.create(**{**shot_values, **shot_new_values})
+            entity = Entity.create(
+                **{**shot_values, **shot_new_values},
+                created_by=self.current_user_id
+            )
 
             index_service.index_shot(entity)
             events.emit(
@@ -257,8 +267,8 @@ class ShotsCsvImportResource(BaseCsvProjectImportResource):
 
         return entity.serialize()
 
-    def run_import(self, project_id, file_path):
-        entities = super().run_import(project_id, file_path)
+    def run_import(self, file_path, project_id):
+        entities = super().run_import(file_path, project_id)
         for task_type in self.task_types_in_project_for_shots:
             create_tasks(task_type.serialize(), self.created_shots)
         return entities

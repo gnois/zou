@@ -1,4 +1,3 @@
-import json
 import datetime
 
 from tests.base import ApiDBTestCase
@@ -11,76 +10,23 @@ from zou.app.models.task_type import TaskType
 
 def totimestamp(dt, epoch=datetime.datetime(1970, 1, 1)):
     td = dt - epoch
-    return (
-        td.microseconds + (td.seconds + td.days * 86400) * 10**6
-    ) / 10**6
+    return (td.microseconds + (td.seconds + td.days * 86400) * 10**6) / 10**6
 
 
 class CommandsTestCase(ApiDBTestCase):
     def setUp(self):
         super(CommandsTestCase, self).setUp()
         self.store = auth_tokens_store
-        for key in self.store.keys():
-            self.store.delete(key)
+        self.store.clear()
 
     def test_clean_auth_tokens_revoked(self):
-        now = datetime.datetime.now()
-        self.store.add(
-            "testkey",
-            json.dumps(
-                {
-                    "token": {
-                        "exp": totimestamp(now + datetime.timedelta(days=8))
-                    },
-                    "revoked": False,
-                }
-            ).encode("utf-8"),
-        )
-        self.store.add(
-            "testkey2",
-            json.dumps(
-                {
-                    "token": {
-                        "exp": totimestamp(now + datetime.timedelta(days=8))
-                    },
-                    "revoked": True,
-                }
-            ).encode("utf-8"),
-        )
+        self.store.add("testkey", "false")
+        self.store.add("testkey2", "false")
         self.assertEqual(len(self.store.keys()), 2)
+        self.store.add("testkey2", "true")
         commands.clean_auth_tokens()
         self.assertEqual(len(self.store.keys()), 1)
         self.assertEqual(self.store.keys()[0], "testkey")
-
-    def test_clean_auth_tokens_expired(self):
-        now = datetime.datetime.now()
-        self.store.add(
-            "testkey",
-            json.dumps(
-                {
-                    "token": {
-                        "exp": totimestamp(now - datetime.timedelta(days=8))
-                    },
-                    "revoked": False,
-                }
-            ).encode("utf-8"),
-        )
-        self.store.add(
-            "testkey2",
-            json.dumps(
-                {
-                    "token": {
-                        "exp": totimestamp(now + datetime.timedelta(days=8))
-                    },
-                    "revoked": False,
-                }
-            ).encode("utf-8"),
-        )
-
-        self.assertEqual(len(self.store.keys()), 2)
-        commands.clean_auth_tokens()
-        self.assertEqual(len(self.store.keys()), 1)
-        self.assertEqual(self.store.keys()[0], "testkey2")
 
     def test_init_data(self):
         commands.init_data()

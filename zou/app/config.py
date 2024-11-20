@@ -6,8 +6,8 @@ from zou.app.utils import dbhelpers
 from zou.app.utils.env import envtobool, env_with_semicolon_to_list
 
 PROPAGATE_EXCEPTIONS = True
-RESTFUL_JSON = {"ensure_ascii": False}
 DEBUG = envtobool("DEBUG", False)
+DEBUG_HOST = os.getenv("DEBUG_HOST", "127.0.0.1")
 DEBUG_PORT = int(os.getenv("DEBUG_PORT", 5000))
 
 APP_NAME = "Zou"
@@ -19,6 +19,7 @@ AUTH_STRATEGY = os.getenv("AUTH_STRATEGY", "auth_local_classic")
 KEY_VALUE_STORE = {
     "host": os.getenv("KV_HOST", "localhost"),
     "port": os.getenv("KV_PORT", "6379"),
+    "password": os.getenv("KV_PASSWORD", None),
 }
 AUTH_TOKEN_BLACKLIST_KV_INDEX = 0
 MEMOIZE_DB_INDEX = 1
@@ -35,6 +36,8 @@ JWT_COOKIE_CSRF_PROTECT = False
 JWT_SESSION_COOKIE = False
 JWT_COOKIE_SAMESITE = "Lax"
 JWT_IDENTITY_CLAIM = "sub"
+
+CLIENT_CACHE_MAX_AGE = int(os.getenv("CLIENT_CACHE_MAX_AGE", 604800))
 
 DATABASE = {
     "drivername": os.getenv("DB_DRIVER", "postgresql+psycopg"),
@@ -79,6 +82,7 @@ MAIL_PORT = os.getenv("MAIL_PORT", 25)
 MAIL_USERNAME = os.getenv("MAIL_USERNAME", "")
 MAIL_PASSWORD = os.getenv("MAIL_PASSWORD", "")
 MAIL_DEBUG = envtobool("MAIL_DEBUG", False)
+MAIL_DEBUG_BODY = envtobool("MAIL_DEBUG_BODY", False)
 MAIL_USE_TLS = envtobool("MAIL_USE_TLS", False)
 MAIL_USE_SSL = envtobool("MAIL_USE_SSL", False)
 MAIL_DEFAULT_SENDER = os.getenv(
@@ -92,8 +96,6 @@ PLUGIN_FOLDER = os.getenv(
 )
 
 FS_BACKEND = os.getenv("FS_BACKEND", "local")
-FS_AES256_ENCRYPTED = envtobool("FS_AES256_ENCRYPTED", False)
-FS_AES256_KEY = os.getenv("FS_AES256_KEY")
 FS_ROOT = PREVIEW_FOLDER
 FS_BUCKET_PREFIX = os.getenv("FS_BUCKET_PREFIX", "")
 FS_SWIFT_AUTHURL = os.getenv("FS_SWIFT_AUTHURL")
@@ -101,10 +103,17 @@ FS_SWIFT_USER = os.getenv("FS_SWIFT_USER")
 FS_SWIFT_TENANT_NAME = os.getenv("FS_SWIFT_TENANT_NAME")
 FS_SWIFT_KEY = os.getenv("FS_SWIFT_KEY")
 FS_SWIFT_REGION_NAME = os.getenv("FS_SWIFT_REGION_NAME")
+FS_SWIFT_CREATE_CONTAINER = envtobool("FS_SWIFT_CREATE_CONTAINER", False)
+FS_SWIFT_AUTH_VERSION = os.getenv("FS_SWIFT_AUTH_VERSION", "3")
+FS_SWIFT_AES256_ENCRYPTED = envtobool("FS_SWIFT_AES256_ENCRYPTED", False)
+FS_SWIFT_AES256_KEY = os.getenv("FS_SWIFT_AES256_KEY")
 FS_S3_REGION = os.getenv("FS_S3_REGION")
 FS_S3_ENDPOINT = os.getenv("FS_S3_ENDPOINT")
 FS_S3_ACCESS_KEY = os.getenv("FS_S3_ACCESS_KEY")
 FS_S3_SECRET_KEY = os.getenv("FS_S3_SECRET_KEY")
+FS_S3_CREATE_BUCKET = envtobool("FS_S3_CREATE_BUCKET", False)
+FS_S3_AES256_ENCRYPTED = envtobool("FS_S3_AES256_ENCRYPTED", False)
+FS_S3_AES256_KEY = os.getenv("FS_S3_AES256_KEY")
 
 ENABLE_JOB_QUEUE = envtobool("ENABLE_JOB_QUEUE", False)
 ENABLE_JOB_QUEUE_REMOTE = envtobool("ENABLE_JOB_QUEUE_REMOTE", False)
@@ -125,16 +134,28 @@ LDAP_IS_AD = envtobool("LDAP_IS_AD", False)
 LDAP_IS_AD_SIMPLE = envtobool("LDAP_IS_AD_SIMPLE", False)
 LDAP_SSL = envtobool("LDAP_SSL", False)
 
+SAML_ENABLED = envtobool("SAML_ENABLED", False)
+SAML_IDP_NAME = os.getenv("SAML_IDP_NAME", "")
+SAML_METADATA_URL = os.getenv("SAML_METADATA_URL", "")
+
 LOGS_MODE = os.getenv("LOGS_MODE", "default")
 LOGS_HOST = os.getenv("LOGS_HOST", "localhost")
 LOGS_PORT = os.getenv("LOGS_PORT", 2202)
 LOGS_TOKEN = os.getenv("LOGS_TOKEN")
 
-SENTRY_DSN = os.getenv("SENTRY_DSN", False)
+SENTRY_ENABLED = envtobool("SENTRY_ENABLED", False)
+SENTRY_DSN = os.getenv("SENTRY_DSN", "")
 SENTRY_SR = float(os.getenv("SENTRY_SR", 1.0))
 SENTRY_DEBUG_URL = os.getenv("SENTRY_DEBUG_URL", False)
 
+SENTRY_KITSU_ENABLED = envtobool("SENTRY_KITSU_ENABLED", False)
+SENTRY_KITSU_DSN = os.getenv("SENTRY_KITSU_DSN", "")
+SENTRY_KITSU_SR = float(os.getenv("SENTRY_KITSU_SR", 0.1))
+
+PROMETHEUS_METRICS_ENABLED = envtobool("PROMETHEUS_METRICS_ENABLED", False)
+
 CRISP_TOKEN = os.getenv("CRISP_TOKEN", "")
+IS_SELF_HOSTED = envtobool("IS_SELF_HOSTED", True)
 
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Europe/Paris")
 
@@ -142,8 +163,14 @@ USER_LIMIT = int(os.getenv("USER_LIMIT", "100"))
 MIN_PASSWORD_LENGTH = int(os.getenv("MIN_PASSWORD_LENGTH", 8))
 PROTECTED_ACCOUNTS = env_with_semicolon_to_list("PROTECTED_ACCOUNTS")
 
+TELEMETRY_URL = os.getenv(
+    "TELEMETRY_URL",
+    f"{'http://localhost:8000' if DEBUG else 'https://account.cg-wire.com'}/api/selfhosted/telemetry/new/",
+)
+
+REMOVE_FILES = envtobool("REMOVE_FILES", False)
+
 # Deprecated
 TO_REVIEW_TASK_STATUS = "To review"
 DEFAULT_FILE_STATUS = "To review"
 DEFAULT_FILE_TREE = os.getenv("DEFAULT_FILE_TREE", "default")
-FILE_TREE_FOLDER = os.getenv("FILE_TREE_FOLDER")

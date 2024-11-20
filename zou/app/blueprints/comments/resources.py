@@ -1,19 +1,22 @@
-import json
+import orjson as json
 
-from flask import abort, request, send_file as flask_send_file
+from flask import abort, request, send_file as flask_send_file, current_app
 from flask_restful import Resource, reqparse
 from flask_jwt_extended import jwt_required
 
 from zou.app.mixin import ArgsMixin
-from zou.app.utils import permissions
+from zou.app.utils import permissions, date_helpers
 
 from zou.app.services import (
+    chats_service,
     comments_service,
     deletion_service,
+    entities_service,
     persons_service,
     tasks_service,
     user_service,
 )
+from zou.app import config
 
 
 class DownloadAttachmentResource(Resource):
@@ -52,20 +55,39 @@ class DownloadAttachmentResource(Resource):
         attachment_file = comments_service.get_attachment_file(
             attachment_file_id
         )
-        comment = tasks_service.get_comment(attachment_file["comment_id"])
-        task = tasks_service.get_task(comment["object_id"])
-        user_service.check_project_access(task["project_id"])
-        user_service.check_entity_access(task["entity_id"])
-        file_path = comments_service.get_attachment_file_path(attachment_file)
+        if attachment_file["comment_id"] is not None:
+            comment = tasks_service.get_comment(attachment_file["comment_id"])
+            task = tasks_service.get_task(comment["object_id"])
+            user_service.check_project_access(task["project_id"])
+            user_service.check_entity_access(task["entity_id"])
+        elif attachment_file["chat_message_id"] is not None:
+            message = chats_service.get_chat_message(
+                attachment_file["chat_message_id"]
+            )
+            chat = chats_service.get_chat_by_id(message["chat_id"])
+            entity = entities_service.get_entity(chat["object_id"])
+            user_service.check_project_access(entity["project_id"])
+        else:
+            raise permissions.PermissionDenied()
         try:
+            file_path = comments_service.get_attachment_file_path(
+                attachment_file
+            )
             return flask_send_file(
                 file_path,
                 conditional=True,
                 mimetype=attachment_file["mimetype"],
                 as_attachment=False,
                 download_name=attachment_file["name"],
+                max_age=config.CLIENT_CACHE_MAX_AGE,
+                last_modified=date_helpers.get_datetime_from_string(
+                    attachment_file["updated_at"]
+                ),
             )
         except Exception:
+            current_app.logger.error(
+                f"Attachment file was not found for: {attachment_file_id}"
+            )
             abort(404)
 
 
@@ -168,11 +190,13 @@ class CommentTaskResource(Resource):
             person_id,
             created_at,
             checklist,
+            links,
         ) = self.get_arguments()
 
         task = tasks_service.get_task(task_id)
         user_service.check_project_access(task["project_id"])
         user_service.check_entity_access(task["entity_id"])
+        user_service.check_task_status_access(task_status_id)
         files = request.files
 
         if not permissions.has_manager_permissions():
@@ -186,6 +210,7 @@ class CommentTaskResource(Resource):
             checklist,
             files,
             created_at,
+            links,
         )
         return comment, 201
 
@@ -200,9 +225,17 @@ class CommentTaskResource(Resource):
                 default=[],
                 location=location,
             )
+            parser.add_argument(
+                "links",
+                type=str,
+                action="append",
+                default=[],
+                location=location,
+            )
         else:
             location = "values"
             parser.add_argument("checklist", default="[]", location=location)
+            parser.add_argument("links", default="[]", location=location)
         parser.add_argument(
             "task_status_id",
             required=True,
@@ -218,9 +251,12 @@ class CommentTaskResource(Resource):
             args["comment"],
             args["person_id"],
             args["created_at"],
-            args["checklist"]
-            if request.is_json
-            else json.loads(args["checklist"]),
+            (
+                args["checklist"]
+                if request.is_json
+                else json.loads(args["checklist"])
+            ),
+            (args["links"] if request.is_json else json.loads(args["links"])),
         )
 
 
@@ -377,6 +413,9 @@ class CommentManyTasksResource(Resource):
         result = []
         for comment in comments:
             try:
+                user_service.check_task_status_access(
+                    comment["task_status_id"]
+                )
                 comment = comments_service.create_comment(
                     person["id"],
                     comment["object_id"],
@@ -385,6 +424,7 @@ class CommentManyTasksResource(Resource):
                     [],
                     {},
                     None,
+                    comment.get("links", []),
                 )
                 result.append(comment)
             except KeyError:

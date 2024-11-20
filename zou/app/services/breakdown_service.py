@@ -16,6 +16,7 @@ from zou.app.utils import fields, events
 from zou.app.services import (
     assets_service,
     entities_service,
+    projects_service,
     shots_service,
 )
 
@@ -49,6 +50,8 @@ def get_casting(shot_id):
             Entity.preview_file_id,
             Entity.source_id,
             Entity.ready_for,
+            Entity.is_shared,
+            Entity.project_id,
         )
         .order_by(EntityType.name, Entity.name)
     )
@@ -60,6 +63,8 @@ def get_casting(shot_id):
         entity_preview_file_id,
         episode_id,
         entity_ready_for,
+        entity_is_shared,
+        entity_project_id,
     ) in links:
         casting.append(
             {
@@ -73,6 +78,8 @@ def get_casting(shot_id):
                 ),
                 "nb_occurences": link.nb_occurences,
                 "label": link.label,
+                "is_shared": entity_is_shared,
+                "project_id": entity_project_id,
             }
         )
     return casting
@@ -92,11 +99,27 @@ def get_production_episodes_casting(project_id):
         .join(EntityType, Entity.entity_type_id == EntityType.id)
         .filter(Episode.project_id == project_id)
         .filter(Entity.canceled != True)
-        .add_columns(Entity.name, EntityType.name, Entity.preview_file_id)
-        .order_by(EntityType.name, Entity.name)
+        .add_columns(
+            Entity.name,
+            EntityType.name,
+            Entity.preview_file_id,
+            Entity.is_shared,
+            Entity.project_id,
+        )
+        .order_by(
+            EntityType.name,
+            Entity.name,
+        )
     )
 
-    for link, entity_name, entity_type_name, entity_preview_file_id in links:
+    for (
+        link,
+        entity_name,
+        entity_type_name,
+        entity_preview_file_id,
+        entity_is_shared,
+        entity_project_id,
+    ) in links:
         episode_id = str(link.entity_in_id)
         if episode_id not in castings:
             castings[episode_id] = []
@@ -111,6 +134,8 @@ def get_production_episodes_casting(project_id):
                 ),
                 "nb_occurences": link.nb_occurences,
                 "label": link.label,
+                "is_shared": entity_is_shared,
+                "project_id": entity_project_id,
             }
         )
     return castings
@@ -138,6 +163,8 @@ def get_sequence_casting(sequence_id, project_id=None, episode_id=None):
             Entity.name,
             EntityType.name,
             Entity.preview_file_id,
+            Entity.is_shared,
+            Entity.project_id,
             Sequence.name,
         )
     )
@@ -162,6 +189,8 @@ def get_sequence_casting(sequence_id, project_id=None, episode_id=None):
         entity_name,
         entity_type_name,
         entity_preview_file_id,
+        entity_is_shared,
+        entity_project_id,
         sequence_name,
     ) in links:
         shot_id = str(link.entity_in_id)
@@ -179,6 +208,8 @@ def get_sequence_casting(sequence_id, project_id=None, episode_id=None):
                 ),
                 "nb_occurences": link.nb_occurences,
                 "label": link.label,
+                "is_shared": entity_is_shared,
+                "project_id": entity_project_id,
             }
         )
     return castings
@@ -259,7 +290,7 @@ def update_casting(entity_id, casting):
                 events.emit(
                     "asset:update",
                     {"asset_id": cast["asset_id"]},
-                    project_id=entity.project_id,
+                    project_id=str(entity.project_id),
                 )
 
     entity_id = str(entity.id)
@@ -771,6 +802,17 @@ def refresh_shot_casting_stats(shot, priority_map=None):
         )
 
 
+def refresh_all_shot_casting_stats():
+    """
+    For all shots in all open projects, it computes how many assets are
+    available. It saves the result on the task level.
+    """
+    for project in projects_service.open_projects():
+        for shot in shots_service.get_shots_for_project(project["id"]):
+            priority_map = _get_task_type_priority_map(project["id"])
+            refresh_shot_casting_stats(shot, priority_map)
+
+
 def _get_task_type_priority_map(project_id):
     task_types = (
         ProjectTaskTypeLink.query.join(TaskType)
@@ -787,7 +829,9 @@ def _get_task_type_priority_map(project_id):
 
 def _is_asset_ready(asset, task, priority_map):
     is_ready = False
-    if "ready_for" in asset and asset["ready_for"] is not None:
+    if asset["is_shared"] and asset["project_id"] != str(task.project_id):
+        is_ready = True
+    elif "ready_for" in asset and asset["ready_for"] is not None:
         priority_ready = priority_map.get(asset["ready_for"], -1) or -1
         priority_task = priority_map.get(str(task.task_type_id), 0) or 0
         is_ready = priority_task <= priority_ready
